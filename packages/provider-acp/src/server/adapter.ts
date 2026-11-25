@@ -475,6 +475,9 @@ export interface AcpAdapterV2Flavor {
   readonly mcpOverHttp?: boolean;
   /** The agent has no tool search of its own, so T3 lists optional tools on demand. */
   readonly deferMcpTools?: boolean;
+  readonly stdioMcpToolExposure?:
+    | typeof McpProviderSession.MCP_TOOL_EXPOSURE_COMPACT
+    | typeof McpProviderSession.MCP_TOOL_EXPOSURE_THEME_BROKER;
   readonly normalizeSessionUpdate?: (
     notification: EffectAcpSchema.SessionNotification,
   ) => EffectAcpSchema.SessionNotification;
@@ -1114,8 +1117,7 @@ const writeAcpMcpCallLauncher = Effect.fn("AcpAdapterV2.writeAcpMcpCallLauncher"
 function acpMcpContext(
   session: McpProviderSession.McpProviderSessionConfig | undefined,
   self: SelfInvocation,
-  mcpOverHttp: boolean | undefined,
-  deferMcpTools: boolean | undefined,
+  flavor: Pick<AcpAdapterV2Flavor, "mcpOverHttp" | "deferMcpTools" | "stdioMcpToolExposure">,
   callLauncher: string | undefined,
 ): AcpMcpContext {
   if (session === undefined) {
@@ -1132,12 +1134,20 @@ function acpMcpContext(
           { name: "ELECTRON_RUN_AS_NODE", value: "1" },
           { name: "T3_ACP_MCP_ENDPOINT", value: session.endpoint },
           { name: "T3_ACP_MCP_AUTHORIZATION", value: session.authorizationHeader },
+          ...(flavor.stdioMcpToolExposure === undefined
+            ? []
+            : [
+                {
+                  name: McpProviderSession.MCP_TOOL_EXPOSURE_BRIDGE_ENV,
+                  value: flavor.stdioMcpToolExposure,
+                },
+              ]),
         ],
       },
     ],
     acpServers: [{ type: "acp", name: "t3-code", serverId: "t3-code" }],
     httpServers:
-      mcpOverHttp === true
+      flavor.mcpOverHttp === true
         ? [
             {
               type: "http",
@@ -1145,7 +1155,7 @@ function acpMcpContext(
               url: session.endpoint,
               headers: [
                 { name: "Authorization", value: session.authorizationHeader },
-                ...(deferMcpTools === true
+                ...(flavor.deferMcpTools === true
                   ? [{ name: McpProviderSession.MCP_TOOL_EXPOSURE_HEADER, value: "deferred" }]
                   : []),
               ],
@@ -2115,16 +2125,10 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
   const callLauncher = yield* writeAcpMcpCallLauncher(host.paths.stateDir);
   const readMcpContext = (threadId: ThreadId | null) =>
     threadId === null
-      ? Effect.succeed(
-          acpMcpContext(undefined, self, flavor.mcpOverHttp, flavor.deferMcpTools, callLauncher),
-        )
+      ? Effect.succeed(acpMcpContext(undefined, self, flavor, callLauncher))
       : mcpSessions
           .read(threadId)
-          .pipe(
-            Effect.map((session) =>
-              acpMcpContext(session, self, flavor.mcpOverHttp, flavor.deferMcpTools, callLauncher),
-            ),
-          );
+          .pipe(Effect.map((session) => acpMcpContext(session, self, flavor, callLauncher)));
   const driver = flavor.driver;
   const continuationRequests = options.continuationRequests;
 

@@ -16,6 +16,10 @@ import * as Scope from "effect/Scope";
 import * as EffectAcpErrors from "effect-acp/errors";
 
 import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
+import {
+  MCP_TOOL_EXPOSURE_COMPACT,
+  MCP_TOOL_EXPOSURE_THEME_BROKER,
+} from "@t3tools/provider-core/server/mcpSession";
 import { PULL_REQUEST_LINKING_INSTRUCTIONS } from "@t3tools/provider-core/server/runtimeInstructions";
 import type { AntigravityAuth } from "../../provider/AntigravityAuth.ts";
 import type * as AcpSessionRuntime from "@t3tools/provider-acp/server/AcpSessionRuntime";
@@ -97,6 +101,7 @@ export interface AntigravityAdapterV2Options {
   >;
   readonly withProcess: AntigravityAuth["withProcess"];
   readonly defaultModel: Effect.Effect<string | undefined>;
+  readonly brokerThemeRead?: boolean;
   readonly supportsNativeGoals?: Effect.Effect<boolean>;
   readonly onSessionStarted?: (
     started: AcpSessionRuntime.AcpSessionRuntimeStartResult,
@@ -232,6 +237,9 @@ export function makeAntigravityAcpAdapterFlavor(
     supportsNativeGoals: options.supportsNativeGoals ?? Effect.succeed(false),
     // Agents that advertise HTTP MCP skip the stdio bridge process; others keep stdio.
     mcpOverHttp: true,
+    stdioMcpToolExposure: options.brokerThemeRead
+      ? MCP_TOOL_EXPOSURE_THEME_BROKER
+      : MCP_TOOL_EXPOSURE_COMPACT,
     sessionCarriesPullRequestLinking: antigravityAppendsSystemPrompt,
     makeRuntime,
     buildAttachmentPrompt: ({ text, attachments, resolveAttachmentPath, promptCapabilities }) =>

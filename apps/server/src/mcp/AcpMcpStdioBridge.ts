@@ -1,4 +1,4 @@
-// Relay JSON-RPC verbatim; schema decoding would reject foreign payloads.
+// Relay JSON-RPC verbatim outside the opt-in Antigravity catalog.
 // @effect-diagnostics globalJsonInEffect:off
 import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
@@ -8,6 +8,13 @@ import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import { discardResponseBody, responsePayloads } from "@t3tools/shared/mcpResponsePayloads";
+import {
+  MCP_TOOL_EXPOSURE_BRIDGE_ENV,
+  MCP_TOOL_EXPOSURE_COMPACT,
+  MCP_TOOL_EXPOSURE_HEADER,
+  MCP_TOOL_EXPOSURE_THEME_BROKER,
+} from "@t3tools/provider-core/server/mcpSession";
+import { isDirectTool, TOOL_SEARCH } from "./McpToolExposure.ts";
 
 /** ACP mandates stdio MCP support; HTTP/SSE support varies. */
 
@@ -36,10 +43,25 @@ const bridgeError = (cause: unknown): AcpMcpBridgeError =>
       });
 
 const decodeJsonLine = Schema.decodeUnknownOption(Schema.fromJsonString(Schema.Unknown));
+const ExtraFields = Schema.Record(Schema.String, Schema.Unknown);
+const decodeToolsList = Schema.decodeUnknownOption(
+  Schema.StructWithRest(
+    Schema.Struct({
+      tools: Schema.Array(
+        Schema.StructWithRest(
+          Schema.Struct({ name: Schema.String, description: Schema.optionalKey(Schema.String) }),
+          [ExtraFields],
+        ),
+      ),
+    }),
+    [ExtraFields],
+  ),
+);
 
 interface JsonRpcEnvelope {
   readonly id?: unknown;
   readonly method?: unknown;
+  readonly params?: unknown;
   readonly error?: unknown;
   readonly result?: unknown;
 }
@@ -49,6 +71,8 @@ const MCP_PROTOCOL_VERSION = "2025-06-18";
 export interface AcpMcpStdioBridgeOptions {
   readonly endpoint: string;
   readonly authorization: string;
+  readonly compactTools?: boolean;
+  readonly brokerThemeRead?: boolean;
   readonly input: NodeJS.ReadableStream;
   readonly output: { write(chunk: string): unknown };
   readonly fetchImplementation?: (url: string, init?: RequestInit) => Promise<Response>;
@@ -56,6 +80,66 @@ export interface AcpMcpStdioBridgeOptions {
 
 function asEnvelope(value: unknown): JsonRpcEnvelope | null {
   return typeof value === "object" && value !== null ? (value as JsonRpcEnvelope) : null;
+}
+
+const THEME_READ = "t3_theme_read";
+const CALL_T3_TOOL = "call_t3_tool";
+const decodeToolCall = Schema.decodeUnknownOption(
+  Schema.Struct({
+    name: Schema.String,
+    arguments: Schema.optionalKey(Schema.Unknown),
+    _meta: Schema.optionalKey(ExtraFields),
+  }),
+);
+const decodeThemeCall = Schema.decodeUnknownOption(
+  Schema.Struct({
+    toolName: Schema.Literal(THEME_READ),
+    arguments: ExtraFields,
+  }),
+  { onExcessProperty: "error" },
+);
+const decodeSearch = Schema.decodeUnknownOption(
+  Schema.Struct({ query: Schema.String.check(Schema.isMaxLength(500)) }),
+  { onExcessProperty: "error" },
+);
+const callThemeTool = {
+  name: CALL_T3_TOOL,
+  description:
+    "Call the read-only T3 Code tool t3_theme_read. Use tool_search to get its full argument schema.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      toolName: { type: "string", enum: [THEME_READ] },
+      arguments: { type: "object", additionalProperties: true },
+    },
+    required: ["toolName", "arguments"],
+    additionalProperties: false,
+  },
+};
+
+function compactListedTools(value: unknown) {
+  const envelope = asEnvelope(value);
+  const listed = Option.getOrUndefined(decodeToolsList(envelope?.result));
+  if (envelope === null || listed === undefined) return value;
+  return {
+    ...envelope,
+    result: {
+      ...listed,
+      tools: listed.tools.map((tool) => {
+        if (tool.name === TOOL_SEARCH) {
+          return {
+            ...tool,
+            description:
+              `${tool.description ?? ""} Search an exact tool name to get its full argument schema.`.trim(),
+          };
+        }
+        // agy snapshots names for the active turn. Keep each name callable and let T3 validate the arguments.
+        return isDirectTool(tool.name)
+          ? tool
+          : { ...tool, inputSchema: { type: "object", additionalProperties: true } };
+      }),
+    },
+  };
 }
 
 function protocolVersionOf(entry: unknown): string | null {
@@ -208,6 +292,7 @@ export function runAcpMcpStdioBridge(options: AcpMcpStdioBridgeOptions): Effect.
   return Effect.gen(function* () {
     let sessionId: string | null = null;
     let protocolVersion: string | null = null;
+    let canBrokerTheme = false;
     const running = new Set<Fiber.Fiber<void>>();
 
     const writeMessage = (message: unknown): Effect.Effect<void> =>
@@ -217,10 +302,37 @@ export function runAcpMcpStdioBridge(options: AcpMcpStdioBridgeOptions): Effect.
 
     const handleServerPayload = Effect.fn("AcpMcpStdioBridge.handleServerPayload")(function* (
       payload: unknown,
+      listing: boolean,
     ): Effect.fn.Return<void> {
       for (const entry of Array.isArray(payload) ? payload : [payload]) {
         protocolVersion = protocolVersionOf(entry) ?? protocolVersion;
-        yield* writeMessage(entry);
+        if (listing && options.brokerThemeRead) {
+          const envelope = asEnvelope(entry);
+          const listed = Option.getOrUndefined(decodeToolsList(envelope?.result));
+          if (envelope !== null && listed !== undefined) {
+            canBrokerTheme = listed.tools.some(({ name }) => name === THEME_READ);
+            const direct = listed.tools.flatMap((tool) => {
+              if (tool.name === TOOL_SEARCH) {
+                return canBrokerTheme
+                  ? [
+                      {
+                        ...tool,
+                        description:
+                          "Discover the read-only T3 Code tool t3_theme_read and its argument schema. Call it with call_t3_tool.",
+                      },
+                    ]
+                  : [];
+              }
+              return isDirectTool(tool.name) ? [tool] : [];
+            });
+            yield* writeMessage({
+              ...envelope,
+              result: { ...listed, tools: canBrokerTheme ? [...direct, callThemeTool] : direct },
+            });
+            continue;
+          }
+        }
+        yield* writeMessage(listing && options.compactTools ? compactListedTools(entry) : entry);
       }
     });
 
@@ -247,6 +359,9 @@ export function runAcpMcpStdioBridge(options: AcpMcpStdioBridgeOptions): Effect.
                 "content-type": "application/json",
                 accept: "application/json, text/event-stream",
                 authorization: options.authorization,
+                ...(options.compactTools || options.brokerThemeRead
+                  ? { [MCP_TOOL_EXPOSURE_HEADER]: MCP_TOOL_EXPOSURE_COMPACT }
+                  : {}),
                 ...(sessionId === null ? {} : { "mcp-session-id": sessionId }),
                 ...(protocolVersion === null ? {} : { "mcp-protocol-version": protocolVersion }),
               },
@@ -265,7 +380,9 @@ export function runAcpMcpStdioBridge(options: AcpMcpStdioBridgeOptions): Effect.
           }
           return yield* discardResponseBody(response);
         }
-        yield* Stream.runForEach(responsePayloads(response, bridgeError), handleServerPayload);
+        yield* Stream.runForEach(responsePayloads(response, bridgeError), (payload) =>
+          handleServerPayload(payload, envelope.method === "tools/list"),
+        );
       },
       (effect, _line, envelope) =>
         effect.pipe(
@@ -279,6 +396,45 @@ export function runAcpMcpStdioBridge(options: AcpMcpStdioBridgeOptions): Effect.
           }),
         ),
     );
+
+    const forwardBrokerCall = Effect.fn("AcpMcpStdioBridge.forwardBrokerCall")(function* (
+      line: string,
+      envelope: JsonRpcEnvelope,
+    ): Effect.fn.Return<void> {
+      const call = Option.getOrUndefined(decodeToolCall(envelope.params));
+      if (call === undefined)
+        return yield* respondWithError(envelope.id, "Invalid tool call.", -32602);
+      const send = (name: string, args: unknown) =>
+        forward(
+          JSON.stringify({ ...envelope, params: { ...call, name, arguments: args } }),
+          envelope,
+        );
+      if (call.name === TOOL_SEARCH && canBrokerTheme) {
+        const search = Option.getOrUndefined(decodeSearch(call.arguments));
+        if (search === undefined)
+          return yield* respondWithError(envelope.id, "Invalid tool search.", -32602);
+        if (/theme/i.test(search.query)) return yield* send(TOOL_SEARCH, { query: THEME_READ });
+        return yield* writeMessage({
+          jsonrpc: "2.0",
+          id: envelope.id,
+          result: {
+            content: [{ type: "text", text: '{"tools":[]}' }],
+            structuredContent: { tools: [] },
+          },
+        });
+      }
+      if (call.name === CALL_T3_TOOL && canBrokerTheme) {
+        const target = Option.getOrUndefined(decodeThemeCall(call.arguments));
+        if (target !== undefined) return yield* send(THEME_READ, target.arguments);
+      } else if (call.name !== TOOL_SEARCH && isDirectTool(call.name)) {
+        return yield* forward(line, envelope);
+      }
+      return yield* respondWithError(
+        envelope.id,
+        "This tool is unavailable through the Antigravity broker.",
+        -32602,
+      );
+    });
 
     // Order only session establishment; SSE responses must bypass it to avoid deadlock. Calls remain concurrent after initialization.
     let sessionBarrier: Effect.Effect<void> = Effect.void;
@@ -335,9 +491,11 @@ export function runAcpMcpStdioBridge(options: AcpMcpStdioBridgeOptions): Effect.
         );
         return;
       }
-      const task = sessionBarrierPending
-        ? sessionBarrier.pipe(Effect.andThen(forward(line, envelope)))
-        : forward(line, envelope);
+      const request =
+        options.brokerThemeRead && envelope.method === "tools/call"
+          ? forwardBrokerCall(line, envelope)
+          : forward(line, envelope);
+      const task = sessionBarrierPending ? sessionBarrier.pipe(Effect.andThen(request)) : request;
       return yield* launch(task);
     });
 
@@ -378,6 +536,9 @@ export async function runAcpMcpCliFastPath(
       runAcpMcpStdioBridge({
         endpoint,
         authorization,
+        compactTools: process.env[MCP_TOOL_EXPOSURE_BRIDGE_ENV] === MCP_TOOL_EXPOSURE_COMPACT,
+        brokerThemeRead:
+          process.env[MCP_TOOL_EXPOSURE_BRIDGE_ENV] === MCP_TOOL_EXPOSURE_THEME_BROKER,
         input: process.stdin,
         output: process.stdout,
       }),

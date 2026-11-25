@@ -606,6 +606,7 @@ export const AntigravityDriver: ProviderDriver<
       makeRuntime,
       withProcess: authFlow.withProcess,
       defaultModel,
+      brokerThemeRead: (yield* HostProcess.Environment).T3CODE_ANTIGRAVITY_THEME_BROKER === "1",
       supportsNativeGoals: provider.snapshot.getSnapshot.pipe(
         Effect.map(
           (snapshot) => snapshot.slashCommands?.some((command) => command.name === "goal") === true,

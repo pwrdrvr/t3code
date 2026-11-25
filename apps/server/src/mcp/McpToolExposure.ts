@@ -18,15 +18,19 @@ const MAX_SESSIONS = 256;
 export interface ListedTool {
   readonly name: string;
   readonly description: string;
+  readonly inputSchema?: Readonly<Record<string, unknown>>;
 }
+
+export const isDirectTool = (name: string) => DIRECT_TOOLS.has(name);
 
 export class McpToolExposure extends Context.Service<
   McpToolExposure,
   {
-    /** Finds tools for the query and lists them to the session from now on. */
+    /** Finds tools and exposes them to a deferring session or returns details for the compact catalog. */
     readonly search: (
       providerSessionId: string,
       query: string,
+      compact: boolean,
     ) => Effect.Effect<ReadonlyArray<ListedTool>>;
     readonly isListed: (providerSessionId: string, tool: string) => boolean;
   }
@@ -60,11 +64,9 @@ export const make = (
     }
   };
   return McpToolExposure.of({
-    search: Effect.fn("McpToolExposure.search")(function* (providerSessionId, query) {
-      const terms = query
-        .toLowerCase()
-        .split(/[^a-z0-9_]+/u)
-        .filter(Boolean);
+    search: Effect.fn("McpToolExposure.search")(function* (providerSessionId, query, compact) {
+      const normalized = query.trim().toLowerCase();
+      const terms = normalized.split(/[^a-z0-9_]+/u).filter(Boolean);
       const found = tools()
         .filter((tool) => tool.name !== TOOL_SEARCH)
         .map((tool) => ({ tool, score: score(tool, terms) }))
@@ -72,16 +74,22 @@ export const make = (
         .sort((a, b) => b.score - a.score)
         .slice(0, MAX_RESULTS)
         .map((match) => match.tool);
-      if (found.length > 0) {
+      if (!compact && found.length > 0) {
         load(
           providerSessionId,
           found.map((tool) => tool.name),
         );
         yield* announceListChanged();
       }
-      return found;
+      return found.map(({ name, description, inputSchema }) => ({
+        name,
+        description,
+        ...(compact && name.toLowerCase() === normalized && inputSchema !== undefined
+          ? { inputSchema }
+          : {}),
+      }));
     }),
     isListed: (providerSessionId, tool) =>
-      DIRECT_TOOLS.has(tool) || loaded.get(providerSessionId)?.has(tool) === true,
+      isDirectTool(tool) || loaded.get(providerSessionId)?.has(tool) === true,
   });
 };

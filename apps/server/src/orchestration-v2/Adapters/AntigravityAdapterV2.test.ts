@@ -3,6 +3,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import {
   ChatFileAttachment,
+  EnvironmentId,
   MessageId,
   NodeId,
   ProjectId,
@@ -12,7 +13,7 @@ import {
   RunId,
   ThreadId,
 } from "@t3tools/contracts";
-import { resolveSelfInvocation } from "@t3tools/shared/nodeRuntime";
+import { resolveSelfInvocation, selfInvocationArgs } from "@t3tools/shared/nodeRuntime";
 import {
   compactDynamicToolOutput,
   htmlRenderFromToolItem,
@@ -41,6 +42,10 @@ import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import * as TestProviderHost from "@t3tools/provider-testing/TestProviderHost";
 import type * as AcpSessionRuntime from "@t3tools/provider-acp/server/AcpSessionRuntime";
+import {
+  MCP_TOOL_EXPOSURE_BRIDGE_ENV,
+  MCP_TOOL_EXPOSURE_COMPACT,
+} from "@t3tools/provider-core/server/mcpSession";
 import { makeAcpAdapterV2 } from "@t3tools/provider-acp/server/adapter";
 import { makeAntigravityAcpRuntime } from "../../provider/acp/AntigravityAcpSupport.ts";
 import { normalizeAntigravitySessionUpdate } from "../../provider/acp/AntigravityProtocol.ts";
@@ -172,6 +177,98 @@ const layerSession = Layer.mergeAll(
   TestProviderHost.layer().pipe(
     Layer.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
   ),
+);
+
+it.live.each([true, false])("compacts only bridged T3 tools with HTTP MCP advertised: %s", (http) =>
+  Effect.gen(function* () {
+    const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+    const random = yield* SecureRandom.SecureRandom;
+    const mcpSessions = yield* McpProviderSessions.McpProviderSessions;
+    const threadId = ThreadId.make("thread-antigravity-mcp-transport");
+    const instanceId = ProviderInstanceId.make("antigravity-mcp-transport");
+    const endpoint = "http://127.0.0.1:43123/mcp";
+    const authorizationHeader = "Bearer fixture";
+    const selfInvocation = yield* resolveSelfInvocation();
+    const mockAgentPath = yield* (yield* Path.Path).fromFileUrl(
+      new URL("../../../scripts/acp-mock-agent.ts", import.meta.url),
+    );
+    yield* mcpSessions.set({
+      environmentId: EnvironmentId.make("environment-antigravity-mcp-transport"),
+      providerInstanceId: instanceId,
+      providerSessionId: "antigravity-mcp-transport",
+      threadId,
+      endpoint,
+      authorizationHeader,
+      browserToolsAvailable: false,
+    });
+    const requests: AcpSessionRuntime.AcpSessionRequestLogEvent[] = [];
+    const adapter = yield* makeAntigravityAdapterV2({
+      instanceId,
+      selfInvocation,
+      defaultModel: Effect.undefined,
+      withProcess: (_stop, task) => task,
+      makeRuntime: (input) =>
+        makeAntigravityAcpRuntime({
+          ...input,
+          childProcessSpawner,
+          spawn: {
+            command: process.execPath,
+            args: [mockAgentPath],
+            cwd: input.cwd,
+            env: { T3_ACP_ANTIGRAVITY: "1", T3_ACP_MCP_HTTP: http ? "1" : "0" },
+          },
+        }).pipe(Effect.provideService(SecureRandom.SecureRandom, random)),
+      nativeLogging: () => ({
+        requestLogger: (event) =>
+          Effect.sync(() => {
+            if (event.status === "started") requests.push(event);
+          }),
+      }),
+    });
+    const modelSelection = { instanceId, model: "gemini-test-low" };
+    const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+      runtimeMode: "approval-required",
+      interactionMode: "default",
+      cwd: process.cwd(),
+    });
+    const session = yield* adapter.openSession({
+      threadId,
+      providerSessionId: ProviderSessionId.make("provider-session-antigravity-mcp-transport"),
+      modelSelection,
+      runtimePolicy,
+    });
+    yield* session.ensureThread({ threadId, modelSelection, runtimePolicy });
+    const payload = requests.find(({ method }) => method === "session/new")?.payload;
+    const servers =
+      typeof payload === "object" && payload !== null && "mcpServers" in payload
+        ? payload.mcpServers
+        : undefined;
+    assert.deepEqual(
+      servers,
+      http
+        ? [
+            {
+              type: "http",
+              name: "t3-code",
+              url: endpoint,
+              headers: [{ name: "Authorization", value: authorizationHeader }],
+            },
+          ]
+        : [
+            {
+              name: "t3-code",
+              command: selfInvocation.command,
+              args: selfInvocationArgs(selfInvocation, ["acp-mcp-bridge"]),
+              env: [
+                { name: "ELECTRON_RUN_AS_NODE", value: "1" },
+                { name: "T3_ACP_MCP_ENDPOINT", value: endpoint },
+                { name: "T3_ACP_MCP_AUTHORIZATION", value: authorizationHeader },
+                { name: MCP_TOOL_EXPOSURE_BRIDGE_ENV, value: MCP_TOOL_EXPOSURE_COMPACT },
+              ],
+            },
+          ],
+    );
+  }).pipe(Effect.provide(layerSession)),
 );
 
 describe("AntigravityAdapterV2 compaction", () => {

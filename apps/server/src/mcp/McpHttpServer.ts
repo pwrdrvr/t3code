@@ -61,7 +61,10 @@ import * as McpWebhookTransport from "./McpWebhookTransport.ts";
 import { HTML_RENDER_TOOL_NAME } from "@t3tools/shared/htmlRender";
 import { compactT3McpToolOutput } from "@t3tools/shared/toolOutput";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
-import { MCP_TOOL_EXPOSURE_HEADER } from "@t3tools/provider-core/server/mcpSession";
+import {
+  MCP_TOOL_EXPOSURE_COMPACT,
+  MCP_TOOL_EXPOSURE_HEADER,
+} from "@t3tools/provider-core/server/mcpSession";
 import * as OrchestratorMcpService from "./OrchestratorMcpService.ts";
 import { PreviewControlsToolkit } from "./toolkits/previewControls/tools.ts";
 import * as PreviewControlsHandlers from "./toolkits/previewControls/handlers.ts";
@@ -1576,7 +1579,11 @@ const layerToolExposure = Layer.effect(
               enabledWhen === undefined || enabledWhen({ protocolVersion: "", capabilities: {} })
             );
           })
-          .map(({ tool }) => ({ name: tool.name, description: tool.description ?? "" })),
+          .map(({ tool }) => ({
+            name: tool.name,
+            description: tool.description ?? "",
+            inputSchema: tool.inputSchema,
+          })),
       () => server.notifications["notifications/tools/list_changed"]({}),
     );
   }),
@@ -1584,8 +1591,9 @@ const layerToolExposure = Layer.effect(
 
 /**
  * A provider session that sends `MCP_TOOL_EXPOSURE_HEADER: deferred` lists only
- * the direct tools and what its `tool_search` calls loaded. Calls are never
- * gated, and every other client lists everything but `tool_search`.
+ * the direct tools and what its `tool_search` calls loaded. The compact stdio
+ * bridge needs every name so agents can call discovered tools within the turn.
+ * Other clients list everything but `tool_search`.
  */
 const layerDeferredListing = McpServer.visibility(
   Effect.gen(function* () {
@@ -1595,6 +1603,12 @@ const layerDeferredListing = McpServer.visibility(
       if (method !== "tools/list") return true;
       const scope = yield* Effect.serviceOption(McpInvocationContext.McpInvocationContext);
       const providerSessionId = Option.getOrUndefined(scope)?.thread?.providerSessionId;
+      if (
+        providerSessionId !== undefined &&
+        headers[MCP_TOOL_EXPOSURE_HEADER] === MCP_TOOL_EXPOSURE_COMPACT
+      ) {
+        return true;
+      }
       if (headers[MCP_TOOL_EXPOSURE_HEADER] !== "deferred" || providerSessionId === undefined) {
         return target !== McpToolExposure.TOOL_SEARCH;
       }

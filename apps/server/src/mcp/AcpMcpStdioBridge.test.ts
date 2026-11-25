@@ -6,18 +6,24 @@ import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import { vi } from "vite-plus/test";
+import {
+  MCP_TOOL_EXPOSURE_COMPACT,
+  MCP_TOOL_EXPOSURE_HEADER,
+} from "@t3tools/provider-core/server/mcpSession";
 
 import { mcpToolSession, runAcpMcpCliFastPath, runAcpMcpStdioBridge } from "./AcpMcpStdioBridge.ts";
 
 function makeHarness(
   responder: (request: Request) => Promise<Response> | Response,
   input = new NodeStream.PassThrough(),
+  compactTools = false,
 ) {
   const written: Array<string> = [];
   const requests: Array<{ readonly headers: Headers; readonly body: string }> = [];
   const bridge = runAcpMcpStdioBridge({
     endpoint: "http://127.0.0.1:1/mcp",
     authorization: "Bearer bridge-test",
+    compactTools,
     input,
     output: {
       write: (chunk: string) => {
@@ -188,6 +194,123 @@ describe("AcpMcpStdioBridge", () => {
         id: 3,
         error: { code: -32603 },
       });
+    }),
+  );
+
+  it.effect.each([false, true])(
+    "keeps tool names and compacts only opted-in lists (%s)",
+    (compact) =>
+      Effect.gen(function* () {
+        const full = { type: "object", properties: { limit: { type: "integer" } } };
+        const core = { name: "task_status", inputSchema: full };
+        const optional = {
+          name: "t3_project_list",
+          description: "List projects",
+          annotations: { readOnlyHint: true },
+          inputSchema: full,
+        };
+        const { input, written, requests, bridge } = makeHarness(
+          () => Response.json({ jsonrpc: "2.0", id: 1, result: { tools: [core, optional] } }),
+          undefined,
+          compact,
+        );
+        const fiber = yield* Effect.forkChild(bridge);
+        input.end('{"jsonrpc":"2.0","id":1,"method":"tools/list"}\n');
+        yield* Fiber.join(fiber);
+
+        expect(requests[0]?.headers.get(MCP_TOOL_EXPOSURE_HEADER)).toBe(
+          compact ? MCP_TOOL_EXPOSURE_COMPACT : null,
+        );
+        expect(JSON.parse(written[0]!).result.tools).toEqual([
+          core,
+          compact
+            ? { ...optional, inputSchema: { type: "object", additionalProperties: true } }
+            : optional,
+        ]);
+      }),
+  );
+
+  it.effect("brokers only the listed theme reader with its original MCP validation", () =>
+    Effect.gen(function* () {
+      const input = new NodeStream.PassThrough();
+      const listed = yield* Deferred.make<void>();
+      const responses = new Map<number, unknown>();
+      const calls: unknown[] = [];
+      const fiber = yield* runAcpMcpStdioBridge({
+        endpoint: "http://127.0.0.1:1/mcp",
+        authorization: "Bearer scoped-fixture",
+        brokerThemeRead: true,
+        input,
+        output: {
+          write: (line) => {
+            const reply = JSON.parse(line) as { id: number };
+            responses.set(reply.id, reply);
+            if (reply.id === 1) Deferred.doneUnsafe(listed, Effect.void);
+          },
+        },
+        fetchImplementation: async (_url, init) => {
+          expect(new Headers(init?.headers).get("authorization")).toBe("Bearer scoped-fixture");
+          const request = JSON.parse(String(init?.body)) as {
+            id: number;
+            method: string;
+            params?: unknown;
+          };
+          if (request.method === "tools/list") {
+            return Response.json({
+              jsonrpc: "2.0",
+              id: request.id,
+              result: {
+                tools: ["task_status", "tool_search", "t3_theme_read", "t3_theme_set"].map(
+                  (name) => ({
+                    name,
+                    inputSchema: { type: "object" },
+                  }),
+                ),
+              },
+            });
+          }
+          calls.push(request.params);
+          return Response.json({
+            jsonrpc: "2.0",
+            id: request.id,
+            error: { code: -32602, message: "original validator" },
+          });
+        },
+      }).pipe(Effect.forkChild);
+      input.write('{"jsonrpc":"2.0","id":1,"method":"tools/list"}\n');
+      yield* Deferred.await(listed);
+      const call = (id: number, name: string, args: object) =>
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id,
+          method: "tools/call",
+          params: { name, arguments: args },
+        });
+      input.end(
+        [
+          call(2, "tool_search", { query: "t3_theme_read" }),
+          call(3, "call_t3_tool", { toolName: "t3_theme_read", arguments: { themeId: 7 } }),
+          call(4, "call_t3_tool", { toolName: "t3_theme_set", arguments: {} }),
+          call(5, "t3_theme_set", {}),
+          "",
+        ].join("\n"),
+      );
+      yield* Fiber.join(fiber);
+      expect(responses.get(1)).toMatchObject({
+        result: {
+          tools: [{ name: "task_status" }, { name: "tool_search" }, { name: "call_t3_tool" }],
+        },
+      });
+      expect(calls).toHaveLength(2);
+      expect(calls).toEqual(
+        expect.arrayContaining([
+          { name: "tool_search", arguments: { query: "t3_theme_read" } },
+          { name: "t3_theme_read", arguments: { themeId: 7 } },
+        ]),
+      );
+      expect(responses.get(3)).toMatchObject({ error: { message: "original validator" } });
+      expect(responses.get(4)).toMatchObject({ error: { code: -32602 } });
+      expect(responses.get(5)).toMatchObject({ error: { code: -32602 } });
     }),
   );
 

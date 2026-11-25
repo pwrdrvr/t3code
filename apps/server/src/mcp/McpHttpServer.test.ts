@@ -18,6 +18,10 @@ import {
   RuntimeMode,
   ThreadId,
 } from "@t3tools/contracts";
+import {
+  MCP_TOOL_EXPOSURE_COMPACT,
+  MCP_TOOL_EXPOSURE_HEADER,
+} from "@t3tools/provider-core/server/mcpSession";
 import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -2253,7 +2257,7 @@ it.effect(
     ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );
 
-it.effect("lists optional tools to a deferring client only after tool_search loads them", () =>
+it.effect("supports deferred listing and on-demand schemas for the compact bridge", () =>
   Effect.scoped(
     Effect.gen(function* () {
       const scopeFor = (token: string): McpInvocationContext.McpThreadInvocationScope => ({
@@ -2270,11 +2274,13 @@ it.effect("lists optional tools to a deferring client only after tool_search loa
       });
       const scopes = new Map([
         ["deferringToken", scopeFor("deferringToken")],
+        ["compactToken", scopeFor("compactToken")],
         ["otherToken", scopeFor("otherToken")],
       ]);
       const tool = (name: string, description: string) =>
         Tool.make(name, {
           description,
+          parameters: Schema.Struct({ limit: Schema.optional(Schema.Int) }),
           success: Schema.Struct({}),
           failure: OrchestratorMcpFailure,
           failureMode: "return",
@@ -2310,12 +2316,12 @@ it.effect("lists optional tools to a deferring client only after tool_search loa
         Layer.build,
       );
       const httpClient = yield* HttpClient.HttpClient;
-      const session = (token: string, deferred: boolean) =>
+      const session = (token: string, exposure?: "deferred" | typeof MCP_TOOL_EXPOSURE_COMPACT) =>
         Effect.gen(function* () {
           const headers = {
             accept: "application/json, text/event-stream",
             authorization: `Bearer ${token}`,
-            ...(deferred ? { "t3-tool-exposure": "deferred" } : {}),
+            ...(exposure === undefined ? {} : { [MCP_TOOL_EXPOSURE_HEADER]: exposure }),
           };
           const initialize = yield* httpClient.post("/mcp", {
             headers,
@@ -2363,10 +2369,32 @@ it.effect("lists optional tools to a deferring client only after tool_search loa
           };
         });
 
-      const deferring = yield* session("deferringToken", true);
-      const other = yield* session("otherToken", false);
+      const deferring = yield* session("deferringToken", "deferred");
+      const compact = yield* session("compactToken", MCP_TOOL_EXPOSURE_COMPACT);
+      const other = yield* session("otherToken");
       expect(yield* deferring.listed).toEqual(["delegate_task", "tool_search"]);
       expect(yield* other.listed).toEqual(["delegate_task", "preview_open", "schedule_task"]);
+
+      expect(yield* compact.listed).toEqual([
+        "delegate_task",
+        "preview_open",
+        "schedule_task",
+        "tool_search",
+      ]);
+      expect((yield* compact.call("tool_search", { query: "browser" })).structuredContent).toEqual({
+        tools: [{ name: "preview_open", description: "Opens a browser preview." }],
+      });
+      expect(
+        (yield* compact.call("tool_search", { query: "preview_open" })).structuredContent,
+      ).toMatchObject({
+        tools: [
+          {
+            name: "preview_open",
+            inputSchema: { type: "object", properties: { limit: { type: "integer" } } },
+          },
+        ],
+      });
+      expect((yield* compact.call("preview_open", { limit: 1 })).structuredContent).toEqual({});
       // Unlisted tools stay callable.
       expect((yield* deferring.call("schedule_task", {})).structuredContent).toEqual({});
 
