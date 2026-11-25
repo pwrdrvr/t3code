@@ -476,7 +476,10 @@ describe("GitHubRest", () => {
     }).pipe(Effect.provide(layer), Effect.withTracer(tracer));
   });
 
-  it.effect("honors a 429 Retry-After for interactive REST and GraphQL calls", () => {
+  it.effect.each([
+    { remaining: "100", quota: "reserved" },
+    { remaining: "0", quota: "exhausted" },
+  ])("honors a 429 Retry-After with $quota REST quota", ({ remaining }) => {
     const host = "github.com";
     const retryAt = NOW + 60_000;
     const resetAt = NOW + 600_000;
@@ -491,7 +494,7 @@ describe("GitHubRest", () => {
               headers: {
                 "x-ratelimit-resource": "core",
                 "x-ratelimit-limit": "5000",
-                "x-ratelimit-remaining": "100",
+                "x-ratelimit-remaining": remaining,
                 "x-ratelimit-reset": String(resetAt / 1_000),
                 "retry-after": "60",
               },
@@ -554,8 +557,16 @@ describe("GitHubRest", () => {
         _tag: "SourceControlRateLimitPausedError",
         retryAt: resetAt,
       });
-      expect((yield* merge).status).toBe(200);
       expect(yield* stats).toEqual(statsData);
+      if (remaining === "0") {
+        expect(yield* Effect.flip(merge)).toMatchObject({
+          _tag: "SourceControlRateLimitPausedError",
+          retryAt: resetAt,
+        });
+        expect(requests).toHaveLength(3);
+        yield* TestClock.setTime(resetAt + 1);
+      }
+      expect((yield* merge).status).toBe(200);
       expect(requests.map((request) => request.headers.authorization)).toEqual([
         "Bearer first",
         "Bearer other-account",
@@ -565,10 +576,12 @@ describe("GitHubRest", () => {
     }).pipe(Effect.provide(layer));
   });
 
-  it.effect("maps REST 403 with an exhausted quota to a rate limit, and 304 to an answer", () => {
+  it.effect("honors an exhausted REST quota while interactive GraphQL remains available", () => {
+    const host = "github.com";
     const resetAt = NOW + 600_000;
+    const statsData = { repository: { pullRequest: { additions: 3, deletions: 1 } } };
     let call = 0;
-    const { layer, requests } = harness(() => {
+    const { layer, requests } = harness((request) => {
       switch (++call) {
         case 1:
           return new Response(null, { status: 304 });
@@ -584,21 +597,24 @@ describe("GitHubRest", () => {
             },
           );
         default:
-          return json({ ok: true });
+          return request.url.endsWith("/graphql") ? json({ data: statsData }) : json({ ok: true });
       }
     });
     return Effect.gen(function* () {
       yield* TestClock.setTime(NOW);
       const api = yield* GitHubRest.GitHubRest;
+      const client = yield* GraphQLClient.make(
+        PullRequestBatchesGraphQLGroup.middleware(GitHubGraphQlClient.GitHubGraphQlAuth),
+      ).pipe(Effect.provide(GitHubGraphQlClient.layer));
       const notModified = yield* api.rest({
-        host: "github.com",
+        host,
         operation: "checks",
         path: "repos/acme/web/pulls/7",
         ifNoneMatch: '"abc"',
       });
       expect(notModified.status).toBe(304);
       const read = api.rest({
-        host: "github.com",
+        host,
         operation: "checks",
         path: "repos/acme/web/pulls/7",
       });
@@ -614,9 +630,14 @@ describe("GitHubRest", () => {
         _tag: "Failure",
         failure: { _tag: "SourceControlRateLimitPausedError", retryAt: resetAt },
       });
+      const stats = yield* client
+        .PullRequestStats({ owner: "acme", name: "web", number: 7 })
+        .pipe(GitHubGraphQlClient.call({ host, operation: "stats", allowReserve: true }));
+      expect(stats).toEqual(statsData);
+      expect(requests).toHaveLength(3);
       yield* TestClock.setTime(resetAt + 1);
       expect((yield* opened).status).toBe(200);
-      expect(requests).toHaveLength(3);
+      expect(requests).toHaveLength(4);
     }).pipe(Effect.provide(layer));
   });
 

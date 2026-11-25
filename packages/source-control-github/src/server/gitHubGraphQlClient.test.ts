@@ -146,24 +146,38 @@ describe("GitHubGraphQlAuth", () => {
     },
   );
 
-  it.effect("pauses the host on a RATE_LIMITED answer sent with HTTP 200", () => {
+  it.effect("pauses GraphQL on a primary RATE_LIMITED answer sent with HTTP 200", () => {
     const reset = Math.floor(NOW / 1000) + 600;
-    const { layer, requests } = harness(() =>
-      json(
-        { data: null, errors: [{ type: "RATE_LIMITED", message: "API rate limit exceeded" }] },
-        { headers: { "x-ratelimit-remaining": "0", "x-ratelimit-reset": String(reset) } },
-      ),
+    const { layer, requests } = harness((request) =>
+      request.url.endsWith("/graphql")
+        ? json(
+            { data: null, errors: [{ type: "RATE_LIMITED", message: "API rate limit exceeded" }] },
+            { headers: { "x-ratelimit-remaining": "0", "x-ratelimit-reset": String(reset) } },
+          )
+        : json({ ok: true }),
     );
     return Effect.gen(function* () {
       yield* TestClock.setTime(NOW);
       const first = yield* Effect.flip(readStats("github.com"));
       expect(first).toMatchObject({ _tag: "GitHubApiRateLimitError", retryAt: reset * 1000 });
-      const api = yield* GitHubRest.GitHubRest;
-      const rest = yield* Effect.flip(
-        api.rest({ host: "github.com", operation: "stack", path: "repos/acme/web/stacks" }),
+      const paused = yield* Effect.flip(
+        readStats("github.com").pipe(
+          Effect.provideService(SourceControlRateLimit.Interactive, true),
+        ),
       );
-      expect(rest).toMatchObject({ _tag: "SourceControlRateLimitPausedError" });
+      expect(paused).toMatchObject({
+        _tag: "SourceControlRateLimitPausedError",
+        retryAt: reset * 1000,
+      });
       expect(requests).toHaveLength(1);
+      const api = yield* GitHubRest.GitHubRest;
+      const rest = yield* api.rest({
+        host: "github.com",
+        operation: "stack",
+        path: "repos/acme/web/stacks",
+      });
+      expect(rest.status).toBe(200);
+      expect(requests).toHaveLength(2);
     }).pipe(Effect.provide(layer));
   });
 

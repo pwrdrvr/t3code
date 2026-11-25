@@ -101,7 +101,7 @@ export class GitHubGraphQlAuth extends GraphQLMiddleware.Service<
                 Effect.map((answer) => {
                   const status = answer.status;
                   const responseHeaders = answer.headers ?? Headers.empty;
-                  const rateLimited = GitHubRequestPolicy.isRateLimited({
+                  const limit = GitHubRequestPolicy.rateLimitKind({
                     status: status ?? 200,
                     headers: responseHeaders,
                     ...(answer.errors === undefined ? {} : { graphqlErrors: answer.errors }),
@@ -109,8 +109,13 @@ export class GitHubGraphQlAuth extends GraphQLMiddleware.Service<
                   const withheld = (answer.errors ?? []).some(
                     (error) => error["type"] === "NOT_FOUND" || error["type"] === "FORBIDDEN",
                   );
-                  return rateLimited
-                    ? { _tag: "RateLimited" as const, status, headers: responseHeaders }
+                  return limit !== undefined
+                    ? {
+                        _tag: "RateLimited" as const,
+                        kind: limit,
+                        status,
+                        headers: responseHeaders,
+                      }
                     : {
                         _tag: "Ok" as const,
                         // The source is local; never trust one GitHub's answer carries.
@@ -163,18 +168,16 @@ const refused = Effect.fn("gitHubGraphQlClient.refused")(function* (
     reason.cause.response !== undefined
       ? yield* reason.cause.response.text.pipe(Effect.orElseSucceed(() => ""))
       : "";
-  const tag = GitHubRequestPolicy.isRateLimited({
+  const limit = GitHubRequestPolicy.rateLimitKind({
     status: status ?? 200,
     headers,
     body,
     ...(reason._tag === "ResponseError" ? { graphqlErrors: reason.errors } : {}),
-  })
-    ? "RateLimited"
-    : status === 401
-      ? "Unauthorized"
-      : status === 404
-        ? "NotFound"
-        : "Failed";
+  });
+  if (limit !== undefined) {
+    return { _tag: "RateLimited", kind: limit, status: status ?? 200, headers } as const;
+  }
+  const tag = status === 401 ? "Unauthorized" : status === 404 ? "NotFound" : "Failed";
   return { _tag: tag, status: status ?? 200, headers } as const;
 });
 
