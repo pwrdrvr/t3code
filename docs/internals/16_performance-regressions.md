@@ -28,10 +28,43 @@ Core wire invariants:
   rows, idle subagents, and older settled threads), and resumes send deltas rather than full
   snapshots.
 
+## Model request budgets
+
+`vp run report:model-requests` starts the real T3 server with fresh state and drives
+`thread start --wait` followed by `thread send --wait`. The pinned Codex, Claude, and
+Antigravity runtimes send requests to synthetic HTTP endpoints on loopback. The server and
+direct runs use fresh provider profiles, dummy keys, and blocked proxy targets. CI runs with
+only the loopback network interface.
+
+```sh
+vp run report:model-requests --codex /path/to/codex --claude /path/to/claude --antigravity /path/to/agy \
+  --budget .t3/model-request-result.json --comparison .t3/model-request-comparison.json
+```
+
+The required runtimes are Codex 0.169.0, Claude Code 2.1.330 (native binary from
+`@anthropic-ai/claude-agent-sdk@0.3.330`), and agy 1.5.16. Omit `--comparison` in CI.
+The comparison pairs each T3 session with a direct first turn from the same physical project
+directory, binary, model, and prompt. Claude uses default permission mode and medium effort.
+Antigravity uses its default permission mode and Gemini 3.1 Pro at low effort. Both Codex paths
+use workspace-write. T3 uses on-request approval, while `codex exec` uses never. The fixture
+uses a plain session because T3 thread launch has no portable per-agent instruction override.
+
+The total counts the exact HTTP body bytes seen during the turn, including auxiliary model
+requests. The breakdown reserializes JSON fields of the largest request carrying the current
+prompt for the configured model, so its components need not add up to the full size. Use
+`--raw <new-local-file>` for opt-in request bodies. Only the numeric budget JSON is uploaded
+by CI. A separate workflow on the default branch validates the artifact and reports the delta
+from a successful `main` measurement.
+
 ## Server process metrics
 
 [`scripts/server-metrics.ts`](../../scripts/server-metrics.ts) benchmarks server CPU, wakeups, RSS,
-heap, and first-request latency against a fake Anthropic API and the real `claude` CLI:
+heap, and first-request latency against a fake Anthropic API and the real `claude` CLI.
+Run `vp run report:server payload` to inspect one turn's model-facing HTTP body sizes
+and tool definitions using the same fixture. This command uses an isolated profile
+and reports byte counts and tool names, with no request text or credentials.
+
+For process measurements:
 
 - Always compare refs with `ab <checkoutA> <checkoutB>` on the same machine rather than comparing
   isolated runs.

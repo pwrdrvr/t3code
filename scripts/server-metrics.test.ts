@@ -23,7 +23,7 @@ import {
   ServerMetrics,
   slope,
 } from "./server-metrics-report.ts";
-import { runAbRounds } from "./server-metrics.ts";
+import { measureModelPayload, runAbRounds } from "./server-metrics.ts";
 
 const decodeMetrics = Schema.decodeSync(ServerMetrics);
 
@@ -64,6 +64,37 @@ const gatedRules = [
   { pattern: /gcPauseMs$/, floor: 10, gate: true },
   { pattern: /./, floor: 300, gate: true },
 ];
+
+it("measures the HTTP body and counts system-role messages as instructions", () => {
+  const system = [{ type: "text", text: "cc_version=2.1.330; cc_entrypoint=sdk-ts;" }];
+  const systemMessage = { role: "system", content: "Deferred tools", output_config: {} };
+  const userMessage = { role: "user", content: "Say héllo" };
+  const tool = {
+    name: "AskUserQuestion",
+    description: "Ask a question",
+    input_schema: { type: "object" },
+  };
+  const body = { model: "fixture", system, messages: [systemMessage, userMessage], tools: [tool] };
+  const raw = JSON.stringify(body, null, 2);
+  const jsonBytes = (value: unknown) => Buffer.byteLength(JSON.stringify(value));
+
+  expect(measureModelPayload(raw, body)).toEqual({
+    model: "fixture",
+    claudeVersion: "2.1.330",
+    bodyBytes: Buffer.byteLength(raw),
+    messageBytes: jsonBytes([userMessage]),
+    instructionBytes: jsonBytes([system, systemMessage]),
+    toolBytes: jsonBytes([tool]),
+    tools: [
+      {
+        name: "AskUserQuestion",
+        bytes: jsonBytes(tool),
+        descriptionBytes: jsonBytes(tool.description),
+        inputSchemaBytes: jsonBytes(tool.input_schema),
+      },
+    ],
+  });
+});
 
 describe("compareMetrics", () => {
   it.each([

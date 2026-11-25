@@ -1,0 +1,68 @@
+{
+  "codex": {
+    "first": {
+      "bytes": 70000,
+      "calls": 1,
+      "primaryBytes": 70000,
+      "inputBytes": 4200,
+      "instructionBytes": 44000,
+      "toolBytes": 24000,
+      "auxiliaryBytes": 0,
+      "auxiliaryCalls": 0
+    },
+    "next": {
+      "bytes": 72000,
+      "calls": 1,
+      "primaryBytes": 72000,
+      "inputBytes": 5500,
+      "instructionBytes": 44000,
+      "toolBytes": 24000,
+      "auxiliaryBytes": 0,
+      "auxiliaryCalls": 0
+    }
+  },
+  "claude": {
+    "first": {
+      "bytes": 80000,
+      "calls": 1,
+      "primaryBytes": 80000,
+      "inputBytes": 2600,
+      "instructionBytes": 33000,
+      "toolBytes": 46500,
+      "auxiliaryBytes": 0,
+      "auxiliaryCalls": 0
+    },
+    "next": {
+      "bytes": 82000,
+      "calls": 1,
+      "primaryBytes": 82000,
+      "inputBytes": 3400,
+      "instructionBytes": 34500,
+      "toolBytes": 46500,
+      "auxiliaryBytes": 0,
+      "auxiliaryCalls": 0
+    }
+  },
+  "antigravity": {
+    "first": {
+      "bytes": 164000,
+      "calls": 2,
+      "primaryBytes": 154000,
+      "inputBytes": 8300,
+      "instructionBytes": 24800,
+      "toolBytes": 124000,
+      "auxiliaryBytes": 8500,
+      "auxiliaryCalls": 1
+    },
+    "next": {
+      "bytes": 155000,
+      "calls": 1,
+      "primaryBytes": 155000,
+      "inputBytes": 9200,
+      "instructionBytes": 24800,
+      "toolBytes": 124000,
+      "auxiliaryBytes": 0,
+      "auxiliaryCalls": 0
+    }
+  }
+}
