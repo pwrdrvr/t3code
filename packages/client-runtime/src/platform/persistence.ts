@@ -22,6 +22,25 @@ export interface CachedShellSnapshot extends DeferredShellSnapshot {
   readonly origin?: ShellCacheOrigin;
 }
 
+export interface VcsRefsCacheScope {
+  readonly cwds: ReadonlySet<string>;
+  readonly gitCommonDirs: ReadonlySet<string>;
+}
+
+const decodeCachedVcsRefsIdentity = Schema.decodeUnknownOption(
+  Schema.fromJsonString(Schema.Struct({ refs: Schema.Struct({ gitCommonDir: Schema.String }) })),
+);
+
+export function shouldClearVcsRefsEntry(scope: VcsRefsCacheScope, cwd: string, payload: unknown) {
+  if (scope.cwds.has(cwd)) return true;
+  const stored = decodeCachedVcsRefsIdentity(payload);
+  return (
+    Option.isNone(stored) ||
+    stored.value.refs.gitCommonDir === "" ||
+    scope.gitCommonDirs.has(stored.value.refs.gitCommonDir)
+  );
+}
+
 export class ConnectionPersistenceError extends Schema.TaggedError<ConnectionPersistenceError>()(
   "ConnectionPersistenceError",
   {
@@ -141,6 +160,7 @@ export class EnvironmentCacheStore extends Context.Service<
      */
     readonly clearVcsRefs: (
       environmentId: EnvironmentId,
+      scope?: VcsRefsCacheScope,
     ) => Effect.Effect<void, ConnectionPersistenceError>;
     readonly clear: (
       environmentId: EnvironmentId,

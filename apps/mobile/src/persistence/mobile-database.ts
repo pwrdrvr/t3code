@@ -99,6 +99,7 @@ export class MobileDatabase extends Context.Service<
     readonly clearCacheKind: (
       environmentId: EnvironmentId,
       kind: ClientCacheKind,
+      shouldRemove?: (key: string, payload: string) => boolean,
     ) => Effect.Effect<void, MobileDatabaseError>;
     readonly clearEnvironmentCache: (
       environmentId: EnvironmentId,
@@ -262,16 +263,37 @@ const makeAvailable = Effect.gen(function* () {
         catch: databaseError("remove-cache"),
       }).pipe(Effect.asVoid),
     ),
-    clearCacheKind: Effect.fn("MobileDatabase.clearCacheKind")((environmentId, kind) =>
-      Effect.tryPromise({
-        try: () =>
-          database.runAsync(
-            "DELETE FROM client_cache WHERE environment_id = ? AND kind = ?",
-            environmentId,
-            kind,
-          ),
-        catch: databaseError("clear-cache-kind"),
-      }).pipe(Effect.asVoid),
+    clearCacheKind: Effect.fn("MobileDatabase.clearCacheKind")(
+      (environmentId, kind, shouldRemove) =>
+        Effect.tryPromise({
+          try: async () => {
+            if (shouldRemove === undefined) {
+              await database.runAsync(
+                "DELETE FROM client_cache WHERE environment_id = ? AND kind = ?",
+                environmentId,
+                kind,
+              );
+              return;
+            }
+            const rows = await database.getAllAsync<{ cache_key: string; payload: string }>(
+              "SELECT cache_key, payload FROM client_cache WHERE environment_id = ? AND kind = ?",
+              environmentId,
+              kind,
+            );
+            for (const row of rows) {
+              if (shouldRemove(row.cache_key, row.payload)) {
+                await database.runAsync(
+                  "DELETE FROM client_cache WHERE environment_id = ? AND kind = ? AND cache_key = ? AND payload = ?",
+                  environmentId,
+                  kind,
+                  row.cache_key,
+                  row.payload,
+                );
+              }
+            }
+          },
+          catch: databaseError("clear-cache-kind"),
+        }),
     ),
     clearEnvironmentCache: Effect.fn("MobileDatabase.clearEnvironmentCache")((environmentId) =>
       Effect.tryPromise({

@@ -80,6 +80,11 @@ export interface ExecuteGitResult {
   readonly stderrTruncated: boolean;
 }
 
+export interface GitRefSnapshot {
+  readonly gitCommonDir: string;
+  readonly stamp: string;
+}
+
 export class GitNothingToCommitError extends Schema.TaggedError<GitNothingToCommitError>()(
   "GitNothingToCommitError",
   {
@@ -421,7 +426,7 @@ export class GitVcsDriver extends Context.Service<
       options?: GitRemoteStatusOptions,
     ) => Effect.Effect<GitRemoteStatusDetails, GitCommandError>;
     /** Refs used by an explicit refresh and its branch-picker digest. */
-    readonly readStatusRefreshRefs: (cwd: string) => Effect.Effect<string | null>;
+    readonly readStatusRefreshRefs: (cwd: string) => Effect.Effect<GitRefSnapshot | null>;
     readonly readStatusPoll: (
       cwd: string,
       branch: string | null,
@@ -432,7 +437,10 @@ export class GitVcsDriver extends Context.Service<
       readonly details: GitRemoteStatusDetails;
     } | null>;
     /** Branch-picker digest input, including worktree paths. */
-    readonly readRefSnapshot: (cwd: string, refs?: string) => Effect.Effect<string | null>;
+    readonly readRefSnapshot: (
+      cwd: string,
+      refs?: GitRefSnapshot,
+    ) => Effect.Effect<GitRefSnapshot | null>;
     readonly prepareCommitContext: (
       cwd: string,
       filePaths?: readonly string[],

@@ -338,6 +338,7 @@ function removeDatabaseValuesInRangeOnConnection(
   database: IDBDatabase,
   storeName: string,
   range: IDBKeyRange,
+  shouldRemove?: (key: IDBValidKey, value: unknown) => boolean,
 ) {
   return Effect.callback<void, ConnectionTransientError>((resume) => {
     try {
@@ -366,7 +367,9 @@ function removeDatabaseValuesInRangeOnConnection(
           return;
         }
         try {
-          cursor.delete();
+          if (shouldRemove === undefined || shouldRemove(cursor.key, cursor.value)) {
+            cursor.delete();
+          }
           cursor.continue();
         } catch (cause) {
           resume(Effect.fail(catalogError("remove", cause)));
@@ -474,9 +477,10 @@ function removeDatabaseValuesInRange(
   database: DatabaseHandle,
   storeName: string,
   range: IDBKeyRange,
+  shouldRemove?: (key: IDBValidKey, value: unknown) => boolean,
 ) {
   return withDatabase(database, (opened) =>
-    removeDatabaseValuesInRangeOnConnection(opened, storeName, range),
+    removeDatabaseValuesInRangeOnConnection(opened, storeName, range, shouldRemove),
   );
 }
 
@@ -1064,11 +1068,19 @@ export const layer = Layer.effectContext(
         },
       ),
       clearVcsRefs: Effect.fn("Persistence.EnvironmentCacheStore.clearVcsRefs")(
-        function (environmentId) {
+        function (environmentId, scope) {
+          const prefix = `${environmentId}:`;
           return removeDatabaseValuesInRange(
             database,
             VCS_REFS_STORE_NAME,
-            IDBKeyRange.bound(`${environmentId}:`, `${environmentId}:\uffff`),
+            IDBKeyRange.bound(prefix, `${prefix}\uffff`),
+            scope &&
+              ((key, payload) =>
+                Persistence.shouldClearVcsRefsEntry(
+                  scope,
+                  String(key).slice(prefix.length),
+                  payload,
+                )),
           ).pipe(Effect.mapError((cause) => persistenceError("clear-vcs-refs", cause)));
         },
       ),

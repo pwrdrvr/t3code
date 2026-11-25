@@ -10,6 +10,38 @@ import { TestClock } from "effect/testing";
 
 import * as ConnectionStorage from "./storage";
 
+it.effect("evicts scoped ref snapshots from IndexedDB without clearing another environment", () =>
+  Effect.gen(function* () {
+    const store = yield* Persistence.EnvironmentCacheStore;
+    const environment = EnvironmentId.make("scoped-vcs");
+    const otherEnvironment = EnvironmentId.make("scoped-vcs-other");
+    const refs = {
+      refs: [],
+      isRepo: true,
+      hasPrimaryRemote: false,
+      nextCursor: null,
+      totalCount: 0,
+    };
+    const affected = { ...refs, gitCommonDir: "/repo/.git" };
+    const unrelated = { ...refs, gitCommonDir: "/other/.git" };
+    yield* store.saveVcsRefs(environment, "/linked", affected);
+    yield* store.saveVcsRefs(environment, "/contradictory", unrelated);
+    yield* store.saveVcsRefs(environment, "/legacy", refs);
+    yield* store.saveVcsRefs(environment, "/unrelated", unrelated);
+    yield* store.saveVcsRefs(otherEnvironment, "/linked", affected);
+
+    yield* store.clearVcsRefs(environment, {
+      gitCommonDirs: new Set(["/repo/.git"]),
+      cwds: new Set(["/contradictory"]),
+    });
+    for (const cwd of ["/linked", "/contradictory", "/legacy"]) {
+      expect(yield* store.loadVcsRefs(environment, cwd)).toEqual(Option.none());
+    }
+    expect(yield* store.loadVcsRefs(environment, "/unrelated")).toEqual(Option.some(unrelated));
+    expect(yield* store.loadVcsRefs(otherEnvironment, "/linked")).toEqual(Option.some(affected));
+  }).pipe(Effect.provide(ConnectionStorage.layer)),
+);
+
 describe("IndexedDB query cache", () => {
   it.effect("round trips per environment and clears with the environment", () =>
     Effect.gen(function* () {

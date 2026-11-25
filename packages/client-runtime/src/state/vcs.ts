@@ -27,19 +27,24 @@ import * as EnvironmentSupervisor from "../connection/supervisor.ts";
 import { safeErrorLogAttributes } from "../errors/safeLog.ts";
 import * as Persistence from "../platform/persistence.ts";
 import {
-  request,
+  requestInSession,
   requestGuarded,
   subscribe,
   subscribeVcsBranch,
   refreshVcsBranch,
   type EnvironmentRpcInput,
 } from "../rpc/client.ts";
+import type { RpcSession } from "../rpc/session.ts";
 import { followStreamInEnvironment } from "./runtime.ts";
 import { vcsCommandConcurrency, vcsCommandScheduler } from "./vcsCommandScheduler.ts";
 import {
   invalidateCachedVcsRefs,
   invalidateCachedVcsRefsIfChanged,
+  recordVcsRefsIdentity,
+  trackVcsRefsList,
   vcsRefsCacheStateAtom,
+  vcsRefsRepositoryRevision,
+  vcsRefsRevisionAtom,
   withVcsRefsPersistenceLock,
 } from "./vcsRefInvalidation.ts";
 
@@ -74,6 +79,7 @@ export const commitVcsRefsRefresh = Effect.fn("CachedVcsRefsState.commitRefresh"
     readonly refs: VcsListRefsResult;
     readonly expectedRevision: number;
     readonly persist: boolean;
+    readonly session?: RpcSession;
   },
 ) {
   return yield* withVcsRefsPersistenceLock(
@@ -81,7 +87,7 @@ export const commitVcsRefsRefresh = Effect.fn("CachedVcsRefsState.commitRefresh"
     Effect.gen(function* () {
       const stateAtom = vcsRefsCacheStateAtom({ environmentId: input.environmentId });
       const state = registry.get(stateAtom);
-      if (state.revision !== input.expectedRevision) {
+      if (registry.get(vcsRefsRevisionAtom(input)) !== input.expectedRevision) {
         return false;
       }
       let persistedCacheReadable = state.persistedCacheReadable;
@@ -113,12 +119,11 @@ export const commitVcsRefsRefresh = Effect.fn("CachedVcsRefsState.commitRefresh"
           ),
         );
         if (persistedCacheReadable !== state.persistedCacheReadable) {
-          registry.update(stateAtom, (current) =>
-            current.revision === input.expectedRevision
-              ? { ...current, persistedCacheReadable }
-              : current,
-          );
+          registry.update(stateAtom, (current) => ({ ...current, persistedCacheReadable }));
         }
+      }
+      if (input.session !== undefined) {
+        recordVcsRefsIdentity(registry, input, input.refs.gitCommonDir, input.session);
       }
       return true;
     }),
@@ -139,10 +144,15 @@ export const makeCachedVcsRefsChanges = Effect.fn("CachedVcsRefsState.makeChange
   const supervisor = yield* EnvironmentSupervisor.EnvironmentSupervisor;
   const cache = yield* Persistence.EnvironmentCacheStore;
   const environmentId = supervisor.target.environmentId;
+  const target = { environmentId, cwd: input.cwd };
   const useCache = canUseVcsRefsCache(input);
-  const cached =
-    useCache && persistedCacheReadable
-      ? yield* cache.loadVcsRefs(environmentId, input.cwd).pipe(
+  const loadCached = Effect.suspend(() =>
+    useCache &&
+    persistedCacheReadable &&
+    (registry === undefined ||
+      (registry.get(vcsRefsCacheStateAtom(target)).persistedCacheReadable &&
+        registry.get(vcsRefsRevisionAtom(target)) === expectedRevision))
+      ? cache.loadVcsRefs(environmentId, input.cwd).pipe(
           Effect.catch((error) =>
             Effect.logWarning("Could not load cached Git refs.").pipe(
               Effect.annotateLogs({
@@ -154,33 +164,52 @@ export const makeCachedVcsRefsChanges = Effect.fn("CachedVcsRefsState.makeChange
             ),
           ),
         )
-      : Option.none<VcsListRefsResult>();
-  const refresh = Effect.fn("CachedVcsRefsState.refresh")(function* () {
+      : Effect.succeedNone,
+  );
+  const cached =
+    registry === undefined
+      ? yield* loadCached
+      : yield* withVcsRefsPersistenceLock(
+          environmentId,
+          Effect.sync(() => trackVcsRefsList(registry, target)).pipe(Effect.andThen(loadCached)),
+        );
+  const refresh = Effect.fn("CachedVcsRefsState.refresh")(function* (session: RpcSession) {
     const revisionAtom = serverRefsRevisionAtom(
       `${environmentId.length}:${environmentId}${input.cwd}`,
     );
-    const bypassServerSnapshot =
-      expectedRevision !== undefined &&
-      registry !== undefined &&
-      expectedRevision > registry.get(revisionAtom);
-    const refs = yield* request(
-      WS_METHODS.vcsListRefs,
-      bypassServerSnapshot ? { ...input, refresh: true } : input,
-    ).pipe(Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor));
-    const persist = cache.saveVcsRefs(environmentId, input.cwd, refs).pipe(
-      Effect.catch((error) =>
-        Effect.logWarning("Could not persist cached Git refs.").pipe(
-          Effect.annotateLogs({
-            environmentId,
-            cwd: input.cwd,
-            ...safeErrorLogAttributes(error),
-          }),
-        ),
-      ),
-    );
+    const read = (force: boolean) =>
+      requestInSession(
+        session,
+        WS_METHODS.vcsListRefs,
+        force ? { ...input, refresh: true } : input,
+      ).pipe(Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor));
+    const lastRefresh = registry?.get(revisionAtom) ?? 0;
+    const force = input.refresh === true || (expectedRevision ?? 0) > lastRefresh;
+    let refreshedThrough = force ? (expectedRevision ?? 0) : 0;
+    let refs = yield* read(force);
     if (expectedRevision === undefined || registry === undefined) {
-      if (useCache) yield* persist;
+      if (useCache) {
+        yield* cache.saveVcsRefs(environmentId, input.cwd, refs).pipe(
+          Effect.catch((error) =>
+            Effect.logWarning("Could not persist cached Git refs.").pipe(
+              Effect.annotateLogs({
+                environmentId,
+                cwd: input.cwd,
+                ...safeErrorLogAttributes(error),
+              }),
+            ),
+          ),
+        );
+      }
       return Option.some(refs);
+    }
+    // A newly visited alias can discover its family only once the server answers.
+    if (refs.gitCommonDir !== undefined) {
+      const familyRevision = vcsRefsRepositoryRevision(registry, environmentId, refs.gitCommonDir);
+      if (familyRevision > Math.max(lastRefresh, refreshedThrough)) {
+        if (!force) refs = yield* read(true);
+        refreshedThrough = familyRevision;
+      }
     }
     const committed = yield* commitVcsRefsRefresh(registry, cache, {
       environmentId,
@@ -188,8 +217,11 @@ export const makeCachedVcsRefsChanges = Effect.fn("CachedVcsRefsState.makeChange
       refs,
       expectedRevision,
       persist: useCache,
+      session,
     });
-    if (committed && bypassServerSnapshot) registry.set(revisionAtom, expectedRevision);
+    if (committed && refreshedThrough > lastRefresh) {
+      registry.update(revisionAtom, (current) => Math.max(current, refreshedThrough));
+    }
     return committed ? Option.some(refs) : Option.none<VcsListRefsResult>();
   });
 
@@ -208,9 +240,7 @@ export const makeCachedVcsRefsChanges = Effect.fn("CachedVcsRefsState.makeChange
       session === null
         ? Stream.empty
         : Stream.fromEffect(
-            refresh().pipe(
-              // Session removal can precede switchMap cancelling this refresh.
-              Effect.catchTags({ EnvironmentRpcUnavailableError: () => Effect.never }),
+            refresh(session).pipe(
               Effect.tapError((error) =>
                 Effect.logWarning("Could not refresh Git refs.").pipe(
                   Effect.annotateLogs({
@@ -271,12 +301,8 @@ export function createVcsEnvironmentAtoms<R, E>(
     return runtime
       .atom((get) => {
         const state = get(vcsRefsCacheStateAtom({ environmentId }));
-        return cachedVcsRefsChanges(
-          environmentId,
-          input,
-          state.revision,
-          state.persistedCacheReadable,
-        );
+        const revision = get(vcsRefsRevisionAtom({ environmentId, cwd: input.cwd }));
+        return cachedVcsRefsChanges(environmentId, input, revision, state.persistedCacheReadable);
       })
       .pipe(
         Atom.setIdleTTL(VCS_REFS_IDLE_TTL_MS),
@@ -296,16 +322,22 @@ export function createVcsEnvironmentAtoms<R, E>(
       cwd: target.input.cwd,
     });
 
-  const invalidateRefsIfChanged = (
+  const invalidateRefsIfChanged = Effect.fn("VcsRefsState.invalidateAfterStatus")(function* (
     target: { readonly environmentId: EnvironmentId; readonly input: { readonly cwd: string } },
     registry: AtomRegistry.AtomRegistry,
     exit: Exit.Exit<VcsRefreshStatusResult, unknown>,
-  ) =>
-    invalidateCachedVcsRefsIfChanged(
+  ) {
+    const supervisor = yield* Effect.serviceOption(EnvironmentSupervisor.EnvironmentSupervisor);
+    const session = Option.isSome(supervisor)
+      ? Option.getOrUndefined(yield* SubscriptionRef.get(supervisor.value.session))
+      : undefined;
+    yield* invalidateCachedVcsRefsIfChanged(
       registry,
       { environmentId: target.environmentId, cwd: target.input.cwd },
-      Exit.isSuccess(exit) ? exit.value.refsDigest : undefined,
+      Exit.isSuccess(exit) ? exit.value : undefined,
+      session,
     );
+  });
 
   return {
     listRefs,

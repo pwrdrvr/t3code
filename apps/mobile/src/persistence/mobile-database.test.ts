@@ -9,7 +9,7 @@ vi.mock("expo-sqlite", () => ({ openDatabaseAsync }));
 
 import * as MobileDatabase from "./mobile-database";
 
-describe("offline pull request cache", () => {
+describe("offline cache", () => {
   const environmentId = "cached-environment" as import("@t3tools/contracts").EnvironmentId;
   const otherEnvironment = "other-environment" as import("@t3tools/contracts").EnvironmentId;
 
@@ -55,5 +55,40 @@ describe("offline pull request cache", () => {
         "Some",
       );
     }),
+  );
+
+  it.effect(
+    "filters eviction by row key and payload within the selected environment and kind",
+    () =>
+      Effect.gen(function* () {
+        yield* Effect.promise(sqliteDatabase);
+        const database = yield* MobileDatabase.make;
+        yield* database.saveCache(environmentId, "vcs-refs", "/linked", 1, "affected");
+        yield* database.saveCache(environmentId, "vcs-refs", "/stale", 1, "other");
+        yield* database.saveCache(environmentId, "vcs-refs", "/unrelated", 1, "other");
+        yield* database.saveCache(otherEnvironment, "vcs-refs", "/linked", 1, "affected");
+        yield* database.saveCache(environmentId, "pull-request", "/linked", 1, "affected");
+
+        yield* database.clearCacheKind(
+          environmentId,
+          "vcs-refs",
+          (key, payload) => key === "/stale" || payload === "affected",
+        );
+        expect(yield* database.loadCache(environmentId, "vcs-refs", "/linked")).toEqual(
+          Option.none(),
+        );
+        expect(yield* database.loadCache(environmentId, "vcs-refs", "/stale")).toEqual(
+          Option.none(),
+        );
+        expect(yield* database.loadCache(environmentId, "vcs-refs", "/unrelated")).toEqual(
+          Option.some("other"),
+        );
+        expect(yield* database.loadCache(otherEnvironment, "vcs-refs", "/linked")).toEqual(
+          Option.some("affected"),
+        );
+        expect(yield* database.loadCache(environmentId, "pull-request", "/linked")).toEqual(
+          Option.some("affected"),
+        );
+      }),
   );
 });

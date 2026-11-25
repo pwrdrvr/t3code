@@ -48,6 +48,7 @@ import {
   invalidateCachedVcsRefs,
   invalidateVcsRefs,
   vcsRefsCacheStateAtom,
+  vcsRefsRevisionAtom,
 } from "./vcsRefInvalidation.ts";
 
 const TARGET = new PrimaryConnectionTarget({
@@ -913,3 +914,192 @@ describe("resolveQuickAction", () => {
     ).toEqual(commit);
   });
 });
+
+const OTHER_ENVIRONMENT = EnvironmentId.make("environment-2");
+
+const setupRefLists = Effect.fnUntraced(function* (
+  gitCommonDir: (cwd: string) => string | undefined,
+) {
+  const requests = yield* Queue.unbounded<VcsListRefsInput>();
+  const saved = yield* Queue.unbounded<{ cwd: string; refs: VcsListRefsResult }>();
+  const stored = new Map<string, Map<string, VcsListRefsResult>>([
+    [TARGET.environmentId, new Map()],
+    [OTHER_ENVIRONMENT, new Map()],
+  ]);
+  let changed = false;
+  const client = {
+    [WS_METHODS.vcsListRefs]: (input: VcsListRefsInput) =>
+      Effect.sync(() => {
+        Queue.offerUnsafe(requests, input);
+        const commonDir = gitCommonDir(input.cwd);
+        return {
+          ...(changed && commonDir === "/repo-0/.git" ? LIVE_REFS : CACHED_REFS),
+          ...(commonDir === undefined ? {} : { gitCommonDir: commonDir }),
+        };
+      }),
+    [WS_METHODS.vcsRefreshStatus]: ({ cwd }: { cwd: string }) =>
+      Effect.sync(() => ({
+        refsDigest: changed && gitCommonDir(cwd) === "/repo-0/.git" ? "changed" : "first",
+        gitCommonDir: gitCommonDir(cwd),
+      })),
+  } as unknown as WsRpcProtocolClient;
+  const activeSession = yield* SubscriptionRef.make(Option.some(session(client)));
+  const supervisor = EnvironmentSupervisor.EnvironmentSupervisor.of({
+    target: TARGET,
+    state: yield* SubscriptionRef.make(CONNECTED_CONNECTION_STATE),
+    session: activeSession,
+    prepared: yield* SubscriptionRef.make(Option.none<PreparedConnection>()),
+    connect: Effect.void,
+    disconnect: Effect.void,
+    retryNow: Effect.void,
+  });
+  const followStream: EnvironmentRegistry.EnvironmentRegistry["Service"]["followStream"] = (
+    _environmentId,
+    stream,
+  ) => Stream.provideService(stream, EnvironmentSupervisor.EnvironmentSupervisor, supervisor);
+  const run: EnvironmentRegistry.EnvironmentRegistry["Service"]["run"] = (_environmentId, effect) =>
+    Effect.provideService(effect, EnvironmentSupervisor.EnvironmentSupervisor, supervisor);
+  const environmentRegistry = EnvironmentRegistry.EnvironmentRegistry.of({
+    run,
+    followStream,
+  } as unknown as EnvironmentRegistry.EnvironmentRegistry["Service"]);
+  const atoms = createVcsEnvironmentAtoms(
+    Atom.runtime(
+      Layer.merge(
+        Layer.succeed(EnvironmentRegistry.EnvironmentRegistry, environmentRegistry),
+        Layer.succeed(
+          Persistence.EnvironmentCacheStore,
+          cacheWithRefs(Option.none(), {
+            loadVcsRefs: (environmentId, cwd) =>
+              Effect.sync(() => Option.fromUndefinedOr(stored.get(environmentId)?.get(cwd))),
+            saveVcsRefs: (environmentId, cwd, refs) =>
+              Effect.sync(() => {
+                stored.get(environmentId)?.set(cwd, refs);
+                Queue.offerUnsafe(saved, { cwd, refs });
+              }),
+            clearVcsRefs: (environmentId, scope) =>
+              Effect.sync(() => {
+                const rows = stored.get(environmentId);
+                if (rows === undefined) return;
+                for (const [cwd, refs] of rows) {
+                  if (
+                    scope === undefined ||
+                    Persistence.shouldClearVcsRefsEntry(scope, cwd, JSON.stringify({ refs }))
+                  ) {
+                    rows.delete(cwd);
+                  }
+                }
+              }),
+          }),
+        ),
+      ),
+    ),
+  );
+  const registry = yield* Effect.acquireRelease(Effect.sync(AtomRegistry.make), (value) =>
+    Effect.sync(() => value.dispose()),
+  );
+  const target = (cwd: string) => ({ environmentId: TARGET.environmentId, input: { cwd } });
+  const open = (cwd: string) =>
+    Effect.acquireRelease(
+      Effect.sync(() =>
+        registry.mount(atoms.listRefs({ ...target(cwd), input: { cwd, limit: 100 } })),
+      ),
+      (unmount) => Effect.sync(unmount),
+    );
+  const readRequests = (cwds: ReadonlyArray<string>) =>
+    Effect.gen(function* () {
+      const inputs = yield* Effect.forEach(cwds, () => Queue.take(requests));
+      const writes = yield* Effect.forEach(cwds, () => Queue.take(saved));
+      expect(inputs.map(({ cwd }) => cwd).sort()).toEqual([...cwds].sort());
+      expect(writes.map(({ cwd }) => cwd).sort()).toEqual([...cwds].sort());
+      return { inputs, writes };
+    });
+
+  return {
+    open,
+    requests,
+    readRequests,
+    connectAgain: SubscriptionRef.set(activeSession, Option.some(session(client))),
+    offline: SubscriptionRef.set(activeSession, Option.none()),
+    refresh: (cwd: string) => atoms.refreshLocalStatusForPicker.run(registry, target(cwd)),
+    changeRefs: Effect.sync(() => {
+      changed = true;
+    }),
+    revision: (cwd: string) => registry.get(vcsRefsRevisionAtom({ ...TARGET, cwd })),
+    stored: stored.get(TARGET.environmentId)!,
+    otherStored: stored.get(OTHER_ENVIRONMENT)!,
+  };
+});
+
+it.effect("reloads only the affected repository for first and changed digests", () =>
+  Effect.gen(function* () {
+    const cwds = Array.from({ length: 8 }, (_, index) => `/repo-${index}`);
+    const fixture = yield* setupRefLists((cwd) => `${cwd}/.git`);
+    for (const cwd of cwds) yield* fixture.open(cwd);
+    const initial = yield* fixture.readRequests(cwds);
+    expect(initial.inputs.every((input) => input.refresh !== true)).toBe(true);
+
+    for (const [index, cwd] of cwds.entries()) {
+      yield* fixture.refresh(cwd);
+      expect(cwds.map(fixture.revision)).toEqual(cwds.map((_, i) => (i <= index ? i + 1 : 0)));
+      const round = yield* fixture.readRequests([cwd]);
+      expect(round.inputs).toEqual([{ cwd, limit: 100, refresh: true }]);
+    }
+
+    const revisions = cwds.map(fixture.revision);
+    for (const cwd of cwds) yield* fixture.refresh(cwd);
+    expect(cwds.map(fixture.revision)).toEqual(revisions);
+
+    yield* fixture.changeRefs;
+    yield* fixture.refresh("/repo-0");
+    const change = yield* fixture.readRequests(["/repo-0"]);
+    expect(change.inputs[0]?.refresh).toBe(true);
+    expect(change.writes[0]?.refs.refs).toEqual(LIVE_REFS.refs);
+    expect(cwds.slice(1).map(fixture.revision)).toEqual(revisions.slice(1));
+  }),
+);
+
+it.effect(
+  "evicts linked, aliased and unidentified refs across reconnect without crossing environments",
+  () =>
+    Effect.gen(function* () {
+      const commonDir = "/repo-0/.git";
+      const fixture = yield* setupRefLists((cwd) => {
+        if (cwd === "/old-server") return undefined;
+        return cwd === "/unrelated" ? "/unrelated/.git" : commonDir;
+      });
+      const affected = ["/repo-0", "/linked", "/symlink", "/old-server"];
+      const cwds = [...affected, "/unrelated"];
+      for (const cwd of cwds) yield* fixture.open(cwd);
+      yield* fixture.readRequests(cwds);
+
+      yield* fixture.refresh("/repo-0");
+      yield* fixture.readRequests(affected);
+      yield* fixture.offline;
+      yield* fixture.connectAgain;
+      yield* fixture.readRequests(cwds);
+
+      const unrelated = { ...CACHED_REFS, gitCommonDir: "/unrelated/.git" };
+      fixture.stored.set("/linked", unrelated);
+      fixture.stored.set("/dormant-alias", { ...CACHED_REFS, gitCommonDir: commonDir });
+      fixture.stored.set("/legacy", CACHED_REFS);
+      fixture.otherStored.set("/repo-0", { ...CACHED_REFS, gitCommonDir: commonDir });
+      yield* fixture.changeRefs;
+      yield* fixture.refresh("/repo-0");
+      const changed = yield* fixture.readRequests(affected);
+      expect(changed.inputs.every((input) => input.refresh === true)).toBe(true);
+      expect(changed.writes.find(({ cwd }) => cwd === "/linked")?.refs.refs).toEqual(
+        LIVE_REFS.refs,
+      );
+      expect(fixture.stored.get("/unrelated")).toEqual(unrelated);
+      expect(fixture.stored.get("/legacy")).toBeUndefined();
+      expect(fixture.stored.get("/dormant-alias")).toBeUndefined();
+      expect(fixture.otherStored.get("/repo-0")?.gitCommonDir).toBe(commonDir);
+
+      // This alias has no live identity yet. Its first response discovers the invalidated family.
+      yield* fixture.open("/dormant-alias");
+      expect(yield* Queue.take(fixture.requests)).toEqual({ cwd: "/dormant-alias", limit: 100 });
+      const discovered = yield* fixture.readRequests(["/dormant-alias"]);
+      expect(discovered.inputs[0]?.refresh).toBe(true);
+    }),
+);
