@@ -89,6 +89,8 @@ import {
   REPOSITORY_BLOBS_GRAPHQL_QUERY,
   LIST_ITEM_GRAPHQL_FIELDS,
   LIST_STATES_GRAPHQL_QUERY,
+  LINKED_LIST_STATES_GRAPHQL_QUERY,
+  LINKED_STATS_GRAPHQL_QUERY,
   LINKED_SUMMARIES_GRAPHQL_QUERY,
   SERVER_VERSION_GRAPHQL_QUERY,
   SOURCE_BRANCH_GRAPHQL_QUERY,
@@ -342,6 +344,9 @@ export type GitLabPullRequestCliError =
 /** GitLab's `per_page` limit. */
 const MAX_PAGE_SIZE = 100;
 export const LINKED_SUMMARY_BATCH_SIZE = MAX_PAGE_SIZE;
+// GitLab multiplies the connection cost by 1 + first * 0.05 for up to 100 IIDs.
+// Forty rows leaves room for nested reviewer and diff fields under its default query budget.
+const LINKED_SUMMARY_GRAPHQL_PAGE_SIZE = 40;
 
 interface LinkedSummaryInput {
   readonly cwd: string;
@@ -358,7 +363,7 @@ const encodeLinkedSummaryQuery = Schema.encodeEffect(
         fullPath: Schema.String,
         iids: Schema.Array(Schema.String),
         first: Schema.Int,
-        after: Schema.NullOr(Schema.String),
+        after: Schema.optionalKey(Schema.NullOr(Schema.String)),
       }),
     }),
   ),
@@ -2327,26 +2332,33 @@ export const make = Effect.gen(function* () {
     if (wanted.size > LINKED_SUMMARY_BATCH_SIZE) {
       return yield* readError(new Error("Too many linked merge requests in one batch."));
     }
+    const readGraphql = (query: string, iids: ReadonlyArray<string>, after?: string | null) =>
+      encodeLinkedSummaryQuery({
+        query,
+        variables: {
+          fullPath: input.repository,
+          iids,
+          first: Math.min(iids.length, LINKED_SUMMARY_GRAPHQL_PAGE_SIZE),
+          ...(after === undefined ? {} : { after }),
+        },
+      }).pipe(
+        Effect.mapError(readError),
+        Effect.flatMap((stdin) =>
+          gitlab.executeApiPage({
+            cwd: input.cwd,
+            host: input.host,
+            path: "graphql",
+            stdin,
+          }),
+        ),
+      );
     const seenCursors = new Set<string>();
     const iids = [...wanted].map(String);
     let after: string | null = null;
     for (let page = 0; page < wanted.size; page++) {
-      const response = yield* gitlab.executeApiPage({
-        cwd: input.cwd,
-        host: input.host,
-        path: "graphql",
-        stdin: yield* encodeLinkedSummaryQuery({
-          query: LINKED_SUMMARIES_GRAPHQL_QUERY,
-          variables: {
-            fullPath: input.repository,
-            iids,
-            first: wanted.size,
-            after,
-          },
-        }).pipe(Effect.mapError(readError)),
-      });
+      const response = yield* readGraphql(LINKED_SUMMARIES_GRAPHQL_QUERY, iids, after);
       if ([400, 404, 405, 422, 501].includes(response.status)) break;
-      if (response.status !== 200)
+      if (response.status !== 200 || response.bodyTruncated)
         return yield* readError(new Error("GitLab GraphQL read failed."));
       const decoded = decodeLinkedSummaryPageJson(response.body);
       // Old servers can respond with HTTP 200 and GraphQL validation errors.
@@ -2367,7 +2379,11 @@ export const make = Effect.gen(function* () {
     // Filter at the target project so fork MRs keep their target IID. Each page uses the
     // same admission guard as GraphQL, including the first compatibility read.
     summaries.clear();
-    for (let page = 1; page <= wanted.size; page++) {
+    let pageSize = wanted.size;
+    for (let page = 1; ; page++) {
+      if (page > wanted.size) {
+        return yield* readError(new Error("GitLab REST pagination exceeded the batch size."));
+      }
       const response = yield* gitlab.executeApiPage({
         cwd: input.cwd,
         host: input.host,
@@ -2375,27 +2391,63 @@ export const make = Effect.gen(function* () {
           ...Array.from(wanted, (number) => ["iids[]", String(number)] as const),
           ["scope", "all"],
           ["state", "all"],
-          ["per_page", String(wanted.size)],
+          ["per_page", String(pageSize)],
           ["page", String(page)],
         ])}`,
       });
       if (response.status !== 200)
         return yield* readError(new Error("GitLab REST list read failed."));
+      if (response.bodyTruncated) {
+        if (pageSize === 1) {
+          return yield* readError(
+            new Error("GitLab REST merge request exceeded the output limit."),
+          );
+        }
+        // Offset pagination changes with per_page, so restart rather than skipping rows.
+        pageSize = Math.floor(pageSize / 2);
+        summaries.clear();
+        page = 0;
+        continue;
+      }
       const decoded = decodeRestLinkedSummariesJson(response.body);
       if (Result.isFailure(decoded)) return yield* readError(decoded.failure);
       add(decoded.success);
-      if (summaries.size === wanted.size) return summaries;
+      if (summaries.size === wanted.size) break;
       const next = response.headers.get("x-next-page");
       const hasNext =
         next === undefined
           ? /;\s*rel="next"/iu.test(response.headers.get("link") ?? "")
           : next !== "";
-      if (!hasNext) return summaries;
+      if (!hasNext) break;
       if (next !== undefined && Number(next) !== page + 1) {
         return yield* readError(new Error("GitLab REST pagination did not advance."));
       }
     }
-    return yield* readError(new Error("GitLab REST pagination exceeded the batch size."));
+    // A server may reject newer summary fields and still support the existing status and stat
+    // selections. Only ask for IIDs returned by REST, in independent, guarded requests.
+    const found = [...summaries.keys()];
+    for (let offset = 0; offset < found.length; offset += LINKED_SUMMARY_GRAPHQL_PAGE_SIZE) {
+      const numbers = found.slice(offset, offset + LINKED_SUMMARY_GRAPHQL_PAGE_SIZE);
+      const slice = numbers.map(String);
+      const statePage = yield* readGraphql(LINKED_LIST_STATES_GRAPHQL_QUERY, slice);
+      const statPage = yield* readGraphql(LINKED_STATS_GRAPHQL_QUERY, slice);
+      const states =
+        statePage.status === 200 && !statePage.bodyTruncated
+          ? Result.getOrUndefined(decodeListStatesJson(statePage.body))
+          : undefined;
+      const stats =
+        statPage.status === 200 && !statPage.bodyTruncated
+          ? Result.getOrUndefined(decodeMergeRequestStatsJson(statPage.body))
+          : undefined;
+      for (const number of numbers) {
+        summaries.set(number, {
+          ...summaries.get(number)!,
+          ...states?.get(number),
+          ...stats?.get(number),
+        });
+      }
+    }
+    return summaries;
   });
 
   const viewerUsername = (input: { readonly cwd: string; readonly host?: string | undefined }) =>

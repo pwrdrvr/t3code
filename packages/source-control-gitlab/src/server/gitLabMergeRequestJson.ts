@@ -1597,6 +1597,15 @@ export const LIST_STATES_GRAPHQL_QUERY = `query($fullPath: ID!, $iids: [String!]
   }
 }`;
 
+export const LINKED_LIST_STATES_GRAPHQL_QUERY = `query($fullPath: ID!, $iids: [String!], $first: Int!) {
+  metadata { enterprise }
+  project(fullPath: $fullPath) {
+    mergeRequests(iids: $iids, first: $first) {
+      nodes { ${LIST_STATE_GRAPHQL_FIELDS} }
+    }
+  }
+}`;
+
 const RawMetadataSchema = Schema.optional(
   Schema.NullOr(Schema.Struct({ enterprise: Schema.optional(Schema.NullOr(Schema.Boolean)) })),
 );
@@ -1941,6 +1950,14 @@ export const MERGE_REQUEST_STATS_GRAPHQL_QUERY = `query($fullPath: ID!, $iids: [
   }
 }`;
 
+export const LINKED_STATS_GRAPHQL_QUERY = `query($fullPath: ID!, $iids: [String!], $first: Int!) {
+  project(fullPath: $fullPath) {
+    mergeRequests(iids: $iids, first: $first) {
+      nodes { iid diffStatsSummary { additions deletions fileCount } }
+    }
+  }
+}`;
+
 const LineCountsSchema = Schema.Struct({ additions: Schema.Int, deletions: Schema.Int });
 
 export const LINKED_SUMMARIES_GRAPHQL_QUERY = `query LinkedMergeRequestSummaries(
@@ -2104,7 +2121,12 @@ const RawMergeRequestStatsSchema = Schema.Struct({
               Schema.NullOr(
                 Schema.Struct({
                   iid: Schema.String,
-                  diffStatsSummary: Schema.NullOr(LineCountsSchema),
+                  diffStatsSummary: Schema.NullOr(
+                    Schema.Struct({
+                      ...LineCountsSchema.fields,
+                      fileCount: Schema.optionalKey(Schema.Int),
+                    }),
+                  ),
                 }),
               ),
             ),
@@ -2121,21 +2143,28 @@ const decodeMergeRequestStats = decodeJsonResult(RawMergeRequestStatsSchema);
  * The counts by merge request number. A merge request GitLab returned no summary for is left
  * out rather than counted as zero, so its row keeps whatever it already showed.
  */
-export function decodeMergeRequestStatsJson(
-  raw: string,
-): Result.Result<
-  ReadonlyMap<number, { readonly additions: number; readonly deletions: number }>,
-  DecodeFailure
-> {
+export function decodeMergeRequestStatsJson(raw: string) {
   const decoded = decodeMergeRequestStats(raw);
   if (!Result.isSuccess(decoded)) {
     return Result.fail(decoded.failure);
   }
-  const stats = new Map<number, { readonly additions: number; readonly deletions: number }>();
+  const stats = new Map<
+    number,
+    {
+      readonly additions: number;
+      readonly deletions: number;
+      readonly changedFiles?: number;
+    }
+  >();
   for (const node of decoded.success.data.project?.mergeRequests?.nodes ?? []) {
     const iid = Number(node?.iid);
     if (!Number.isSafeInteger(iid) || iid <= 0 || node?.diffStatsSummary == null) continue;
-    stats.set(iid, node.diffStatsSummary);
+    const { additions, deletions, fileCount } = node.diffStatsSummary;
+    stats.set(iid, {
+      additions,
+      deletions,
+      ...(fileCount === undefined ? {} : { changedFiles: fileCount }),
+    });
   }
   return Result.succeed(stats);
 }

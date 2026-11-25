@@ -150,10 +150,18 @@ function batch(input: ProcessRunner.ProcessRunInput) {
   return parsed.variables;
 }
 
+function linkedPage({ fullPath, iids, first, after }: ReturnType<typeof batch>) {
+  const start = after === null ? 0 : Number(after);
+  const end = start + first;
+  return graphPage(
+    iids.slice(start, end).map((iid) => node(fullPath, iid)),
+    end < iids.length ? String(end) : null,
+  );
+}
+
 function benchmarkReply(input: ProcessRunner.ProcessRunInput) {
   if (input.args.includes("--include")) {
-    const { fullPath, iids } = batch(input);
-    return graphPage(iids.map((iid) => node(fullPath, iid)));
+    return linkedPage(batch(input));
   }
   const path = input.args[1] ?? "";
   const detail = /projects\/([^/]+)\/merge_requests\/(\d+)/u.exec(path);
@@ -373,8 +381,8 @@ describe("GitLab linked merge request sync", () => {
     [1, 1, 1],
     [40, 1, 1],
     [40, 4, 4],
-    [400, 1, 4],
-    [400, 4, 4],
+    [400, 1, 12],
+    [400, 4, 12],
   ] as const)(
     "batches %i linked MRs in %i repositories into %i calls per sweep",
     ([count, repos, calls]) =>
@@ -390,16 +398,16 @@ describe("GitLab linked merge request sync", () => {
           Effect.sync(() => {
             const variables = batch(input);
             batches.push(variables);
-            return graphPage(variables.iids.map((iid) => node(variables.fullPath, iid)));
+            return linkedPage(variables);
           }),
         );
         yield* fixture.reactor.drain;
         assert.lengthOf(batches, calls);
+        assert.isTrue(batches.every(({ first }) => first <= 40));
         assert.lengthOf(
-          batches.flatMap(({ iids }) => iids),
-          count,
+          batches.filter(({ after }) => after === null),
+          Math.ceil(count / repos / 100) * repos,
         );
-        assert.isTrue(batches.every(({ iids, first }) => first === iids.length && first <= 100));
         assert.equal(fixture.seen.size, count);
         const snapshot = fixture.seen.get(ThreadId.make("team/repo-0!1"));
         assert.include(snapshot!, {
@@ -484,9 +492,27 @@ describe("GitLab linked merge request sync", () => {
             const path = input.args[1] ?? "";
             calls.push(path);
             if (path === "graphql") {
-              return input.args.includes("--include")
-                ? page({ errors: [{ message: "Field 'closedAt' does not exist" }] }, { code: 1 })
-                : recordedProcess("{}");
+              if (!input.args.includes("--include")) return recordedProcess("{}");
+              if (input.stdin?.includes("LinkedMergeRequestSummaries")) {
+                return page(
+                  { errors: [{ message: "Field 'closedAt' does not exist" }] },
+                  { code: 1 },
+                );
+              }
+              assert.include(input.stdin, '"iids":["1","2"]');
+              const withStats = input.stdin?.includes("diffStatsSummary") === true;
+              const nodes = ["1", "2"].map((iid) => {
+                const { approved, approvedBy, reviewers, headPipeline, diffStatsSummary } = node(
+                  "team/target",
+                  iid,
+                );
+                return withStats
+                  ? { iid, diffStatsSummary }
+                  : { iid, approved, approvedBy, reviewers, headPipeline };
+              });
+              return page({
+                data: { metadata: { enterprise: true }, project: { mergeRequests: { nodes } } },
+              });
             }
             const url = new URL(path, `https://${HOST}/`);
             if (url.pathname.endsWith("/merge_requests/1")) {
@@ -503,24 +529,68 @@ describe("GitLab linked merge request sync", () => {
           }),
         );
         yield* fixture.reactor.drain;
-        assert.lengthOf(calls, 3);
+        assert.lengthOf(calls, 5);
         assert.deepInclude(fixture.seen.get(ThreadId.make("team/target!2")), {
           state: "closed",
           closedAt: START,
-          changedFiles: 2,
+          changedFiles: 1,
+          additions: 5,
+          deletions: 2,
+          reviewDecision: "changes-requested",
+          checksState: "passing",
         });
         assert.isFalse(fixture.seen.has(ThreadId.make("team/target!3")));
 
         yield* fixture.reactor.requestSync({ host: HOST, repository: "team/target", number: 1 });
         yield* fixture.reactor.drain;
-        assert.isTrue(calls.slice(3).some((path) => path.includes("/merge_requests/1?")));
+        assert.isTrue(calls.slice(5).some((path) => path.includes("/merge_requests/1?")));
         assert.equal(fixture.seen.get(ThreadId.make("team/target!1"))?.title, "Manual detail");
       }),
   );
 
-  it.effect(
-    "stops the REST fallback on its first throttled page and retains a date Retry-After",
-    () =>
+  it.effect("restarts REST pagination at a smaller size after a truncated later page", () =>
+    Effect.gen(function* () {
+      const pages: Array<readonly [number, number]> = [];
+      const repository = repo("team/target", [1, 2, 3, 4]);
+      const fixture = yield* makeFixture([repository], (input) =>
+        Effect.sync(() => {
+          const path = input.args[1] ?? "";
+          if (path === "graphql") {
+            return page({ errors: [{ message: "Unsupported query" }] }, { code: 1 });
+          }
+          const url = new URL(path, `https://${HOST}/`);
+          const size = Number(url.searchParams.get("per_page"));
+          const number = Number(url.searchParams.get("page"));
+          pages.push([size, number]);
+          if (size === 4 || (size === 2 && number === 2)) {
+            return { ...page(null), stdoutTruncated: true };
+          }
+          const start = (number - 1) * size + 1;
+          return page(
+            Array.from({ length: size }, (_, offset) => restRow("team/target", start + offset)),
+            {
+              header: `X-Next-Page: ${start + size <= 4 ? number + 1 : ""}`,
+            },
+          );
+        }),
+      );
+      yield* fixture.reactor.drain;
+      assert.deepEqual(pages, [
+        [4, 1],
+        [2, 1],
+        [2, 2],
+        [1, 1],
+        [1, 2],
+        [1, 3],
+        [1, 4],
+      ]);
+      assert.equal(fixture.seen.size, 4);
+    }),
+  );
+
+  it.effect.each(["REST page", "enrichment"] as const)(
+    "stops the REST fallback when its %s is throttled and retains a date Retry-After",
+    (phase) =>
       Effect.gen(function* () {
         const repository = repo("team/target", [1, 2, 3]);
         const deadline = Date.parse(START) + 121_000;
@@ -529,17 +599,22 @@ describe("GitLab linked merge request sync", () => {
           Effect.sync(() => {
             const path = input.args[1] ?? "";
             calls.push(path);
-            return path === "graphql"
-              ? page({ errors: [{ message: "Unsupported query" }] }, { code: 1 })
-              : page([], {
-                  status: 429,
-                  header: "Retry-After: Fri, 28 Aug 2026 12:02:01 GMT",
-                  code: 1,
-                });
+            if (input.stdin?.includes("LinkedMergeRequestSummaries")) {
+              return page({ errors: [{ message: "Unsupported query" }] }, { code: 1 });
+            }
+            if (phase === "enrichment" && path !== "graphql") {
+              return page([restRow("team/target", 1)]);
+            }
+            return page([], {
+              status: 429,
+              header: "Retry-After: Fri, 28 Aug 2026 12:02:01 GMT",
+              code: 1,
+            });
           }),
         );
         yield* fixture.reactor.drain;
-        assert.lengthOf(calls, 2);
+        const attempts = phase === "REST page" ? 2 : 3;
+        assert.lengthOf(calls, attempts);
         assert.include(calls[1], "page=1");
         assert.equal(fixture.seen.size, 0);
         const ref = {
@@ -555,7 +630,7 @@ describe("GitLab linked merge request sync", () => {
             cause: { _tag: "PullRequestProviderError", reason: "rate-limited", retryAt: deadline },
           },
         });
-        assert.lengthOf(calls, 2);
+        assert.lengthOf(calls, attempts);
       }),
   );
 

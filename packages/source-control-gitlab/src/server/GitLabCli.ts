@@ -535,9 +535,10 @@ interface GitLabApiPage {
   readonly status: number;
   readonly headers: ReadonlyMap<string, string>;
   readonly body: string;
+  readonly bodyTruncated: boolean;
 }
 
-function apiPage(stdout: string): GitLabApiPage | undefined {
+function apiPage(stdout: string): Omit<GitLabApiPage, "bodyTruncated"> | undefined {
   const separator = /\r?\n\r?\n/u.exec(stdout);
   if (separator === null) return undefined;
   const [statusLine, ...fields] = stdout.slice(0, separator.index).split(/\r?\n/u);
@@ -683,7 +684,9 @@ export const make = Effect.gen(function* () {
     );
     const page = apiPage(output.stdout);
     // glab exits nonzero for a GraphQL errors response even though the HTTP status is 200.
-    if (page !== undefined && !output.stdoutTruncated && !output.stdoutInvalidUtf8) return page;
+    if (page !== undefined && (output.stdoutTruncated || !output.stdoutInvalidUtf8)) {
+      return { ...page, bodyTruncated: output.stdoutTruncated };
+    }
     const kind = output.exitCode === 0 ? "command-failed" : classifyGlabFailure(output.stderr);
     return yield* GitLabCliCommandError.fromVcsError(context, failure(kind ?? "command-failed"));
   });
