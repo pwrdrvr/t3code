@@ -77,10 +77,12 @@ jobs:
         env:
           MODEL_REPORT_PULL: ${{ steps.resolve.outputs.pull }}
           MODEL_REPORT_PR_DIR: ${{ steps.current.outcome == 'success' && steps.current.outputs.download-path || '' }}
+          MODEL_REPORT_CURRENT_ATTEMPT: ${{ steps.resolve.outputs.current_attempt }}
           MODEL_REPORT_BASE_DIR: ${{ steps.baseline.outcome == 'success' && steps.baseline.outputs.download-path || '' }}
           MODEL_REPORT_BASE_RUN: ${{ steps.resolve.outputs.baseline_run }}
           MODEL_REPORT_BASE_SHA: ${{ steps.resolve.outputs.baseline_sha }}
-          MODEL_REPORT_EXACT_BASE: ${{ steps.resolve.outputs.exact_base }}
+          MODEL_REPORT_RUN_BASE_SHA: ${{ steps.resolve.outputs.run_base_sha }}
+          MODEL_REPORT_PR_BASE_SHA: ${{ steps.resolve.outputs.pr_base_sha }}
         with:
           script: |
             const report = require("./.github/scripts/model-request-report.cjs");

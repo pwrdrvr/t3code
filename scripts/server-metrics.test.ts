@@ -1,6 +1,7 @@
 import { it as effectIt } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
+import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/http";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
@@ -23,7 +24,7 @@ import {
   ServerMetrics,
   slope,
 } from "./server-metrics-report.ts";
-import { measureModelPayload, runAbRounds } from "./server-metrics.ts";
+import { measureModelPayload, runAbRounds, serveFakeAnthropic } from "./server-metrics.ts";
 
 const decodeMetrics = Schema.decodeSync(ServerMetrics);
 
@@ -94,6 +95,36 @@ it("measures the HTTP body and counts system-role messages as instructions", () 
       },
     ],
   });
+});
+
+effectIt.live("records the token-count HTTP body as auxiliary traffic only in payload mode", () => {
+  const body = JSON.stringify({
+    model: "fixture",
+    tools: [{ name: "one" }, { name: "two" }],
+    messages: [{ role: "user", content: "Say héllo" }],
+  });
+  return Effect.gen(function* () {
+    for (const capturePayload of [true, false]) {
+      const api = yield* serveFakeAnthropic(capturePayload);
+      const response = yield* HttpClient.execute(
+        HttpClientRequest.post(
+          `http://127.0.0.1:${api.port}/v1/messages/count_tokens?beta=true`,
+        ).pipe(HttpClientRequest.bodyText(body)),
+      );
+      expect(yield* response.json).toEqual({ input_tokens: 100 });
+      if (capturePayload) {
+        expect(api.requests).toMatchObject([
+          {
+            agent: false,
+            stream: false,
+            payload: { route: "/v1/messages/count_tokens", bodyBytes: Buffer.byteLength(body) },
+          },
+        ]);
+      } else {
+        expect(api.requests).toEqual([]);
+      }
+    }
+  }).pipe(Effect.scoped, Effect.provide(FetchHttpClient.layer));
 });
 
 describe("compareMetrics", () => {

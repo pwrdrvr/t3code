@@ -114,7 +114,15 @@ function impact(current, baseline) {
   return `${sign}${format(Math.abs(delta))}${percent}`;
 }
 
-function renderComment({ current, baseline, source, baselineRun, exactBase, runUrl }) {
+function renderComment({
+  current,
+  baseline,
+  source,
+  baselineRun,
+  runBaseSha,
+  pullBaseSha,
+  runUrl,
+}) {
   const stamp = `<!-- t3-model-request-run ${source.sha} ${source.number} ${source.attempt} ${current ? "result" : "missing"} -->`;
   const lines = [MARKER, stamp, "## Model request impact", ""];
   const sourceLink = `[\`${source.sha.slice(0, 7)}\`](${runUrl(source.id)})`;
@@ -165,10 +173,18 @@ function renderComment({ current, baseline, source, baselineRun, exactBase, runU
   );
   if (!baseline) {
     lines.push(
-      "> A successful `main` baseline is unavailable. CI still checks the PR ceilings.",
+      runBaseSha
+        ? "> No usable `main` measurement was found for the CI run's base or a recent `main` commit. CI still checks the PR ceilings."
+        : "> GitHub did not report the base for this CI run. A successful `main` baseline is unavailable. CI still checks the PR ceilings.",
       "",
     );
-  } else if (!exactBase) {
+  } else if (!runBaseSha) {
+    const comparison =
+      baselineRun.sha === pullBaseSha
+        ? "the current PR base"
+        : "the latest available successful `main` measurement";
+    lines.push(`> GitHub did not report the base for this CI run. Deltas use ${comparison}.`, "");
+  } else if (baselineRun.sha !== runBaseSha) {
     lines.push(
       "> Deltas use the latest available successful `main` measurement. The exact base has no usable measurement.",
       "",
@@ -191,10 +207,14 @@ function renderComment({ current, baseline, source, baselineRun, exactBase, runU
   const baselineLink = baseline
     ? `[\`${baselineRun.sha.slice(0, 7)}\`](${runUrl(baselineRun.id)})`
     : "unavailable";
+  const measurementAttempt =
+    source.measurementAttempt && source.measurementAttempt !== source.attempt
+      ? ` · Model measurement from attempt ${source.measurementAttempt}`
+      : "";
   lines.push(
     "Real agent processes sent these HTTP request bodies to synthetic loopback model endpoints. Totals include auxiliary model calls.",
     "",
-    `Baseline ${baselineLink} · PR ${sourceLink} · Source CI ${source.conclusion}`,
+    `Baseline ${baselineLink} · PR ${sourceLink} · Source CI ${source.conclusion}${measurementAttempt}`,
   );
   return lines.join("\n");
 }
@@ -234,16 +254,33 @@ async function findPull(github, context, source) {
   return matching.length === 1 ? matching[0] : undefined;
 }
 
-async function artifactForRun(github, repo, runId) {
+async function artifactForAttempt(github, repo, runId, attempt) {
+  const name = `${ARTIFACT}-${attempt}`;
   const { data } = await github.rest.actions.listWorkflowRunArtifacts({
     ...repo,
     run_id: runId,
-    name: ARTIFACT,
+    name,
     per_page: 100,
   });
-  const found = data.artifacts.filter(({ name, expired }) => name === ARTIFACT && !expired);
+  const found = data.artifacts.filter((artifact) => artifact.name === name && !artifact.expired);
   const [artifact] = found;
   return found.length === 1 && artifact.size_in_bytes <= MAX_BYTES ? artifact : undefined;
+}
+
+async function artifactForRun(github, repo, run) {
+  for (let attempt = run.run_attempt; attempt > 0; attempt--) {
+    const artifact = await artifactForAttempt(github, repo, run.id, attempt);
+    if (artifact) return { id: artifact.id, attempt };
+    if (attempt === 1) return undefined;
+    // A partial rerun can skip the benchmark job. Only then reuse its earlier result.
+    const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRunAttempt, {
+      ...repo,
+      run_id: run.id,
+      attempt_number: attempt,
+      per_page: 100,
+    });
+    if (jobs.some((job) => job.name === "Model request budget")) return undefined;
+  }
 }
 
 async function resolve({ github, context, core }) {
@@ -254,8 +291,12 @@ async function resolve({ github, context, core }) {
   const pull = await findPull(github, context, source);
   if (!pull) return core.info("No current pull request into main matches this CI run.");
 
-  const current = await artifactForRun(github, context.repo, source.id);
-  const baseSha = source.pull_requests?.find(({ number }) => number === pull.number)?.base?.sha;
+  const current = await artifactForRun(github, context.repo, source);
+  const reportedBaseSha = source.pull_requests?.find(({ number }) => number === pull.number)?.base
+    ?.sha;
+  const runBaseSha = SHA.test(reportedBaseSha) ? reportedBaseSha : undefined;
+  const pullBaseSha = SHA.test(pull.base.sha) ? pull.base.sha : undefined;
+  const comparisonSha = runBaseSha ?? pullBaseSha;
   const runs = async (filters) => {
     const { data } = await github.rest.actions.listWorkflowRuns({
       ...context.repo,
@@ -269,14 +310,14 @@ async function resolve({ github, context, core }) {
     return data.workflow_runs;
   };
   const [exact, recent] = current
-    ? await Promise.all([baseSha && SHA.test(baseSha) ? runs({ head_sha: baseSha }) : [], runs({})])
+    ? await Promise.all([comparisonSha ? runs({ head_sha: comparisonSha }) : [], runs({})])
     : [[], []];
   const candidates = new Map([...exact, ...recent].map((run) => [run.id, run]));
   let baseline;
   for (const run of candidates.values()) {
     if (run.head_repository?.id !== context.payload.repository.id || !SHA.test(run.head_sha))
       continue;
-    const artifact = await artifactForRun(github, context.repo, run.id);
+    const artifact = await artifactForRun(github, context.repo, run);
     if (artifact) {
       baseline = { id: run.id, sha: run.head_sha, artifactId: artifact.id };
       break;
@@ -284,10 +325,12 @@ async function resolve({ github, context, core }) {
   }
   core.setOutput("pull", pull.number);
   core.setOutput("current_artifact", current?.id ?? "");
+  core.setOutput("current_attempt", current?.attempt ?? "");
   core.setOutput("baseline_artifact", baseline?.artifactId ?? "");
   core.setOutput("baseline_run", baseline?.id ?? "");
   core.setOutput("baseline_sha", baseline?.sha ?? "");
-  core.setOutput("exact_base", Boolean(baseline && baseline.sha === baseSha));
+  core.setOutput("run_base_sha", runBaseSha ?? "");
+  core.setOutput("pr_base_sha", pullBaseSha ?? "");
 }
 
 async function publish({ github, context, core }, env = process.env) {
@@ -300,6 +343,7 @@ async function publish({ github, context, core }, env = process.env) {
     id: run.id,
     number: run.run_number,
     attempt: run.run_attempt,
+    measurementAttempt: Number(env.MODEL_REPORT_CURRENT_ATTEMPT),
     conclusion: run.conclusion,
   };
   const baselineRun = { id: Number(env.MODEL_REPORT_BASE_RUN), sha: env.MODEL_REPORT_BASE_SHA };
@@ -310,7 +354,8 @@ async function publish({ github, context, core }, env = process.env) {
     baseline,
     source,
     baselineRun,
-    exactBase: env.MODEL_REPORT_EXACT_BASE === "true",
+    runBaseSha: env.MODEL_REPORT_RUN_BASE_SHA,
+    pullBaseSha: env.MODEL_REPORT_PR_BASE_SHA,
     runUrl,
   });
   const params = { ...context.repo, issue_number: pullNumber };

@@ -185,7 +185,7 @@ interface ApiRequest {
   readonly marker: string | undefined;
   /** The request carries a tool result, so it is a turn's follow-up rather than its start. */
   readonly toolResult: boolean;
-  readonly payload?: ReturnType<typeof measureModelPayload>;
+  readonly payload?: ReturnType<typeof measureModelPayload> & { readonly route: string };
   /** When the reply's last event was produced; streamed replies only. */
   endedAt?: number;
 }
@@ -249,13 +249,15 @@ const endsInToolResult = (messages: typeof MessagesRequest.Type.messages) => {
 };
 
 /** Streams a canned reply to every Messages request; a prompt holding SLOW_MARKER streams slowly. */
-const serveFakeAnthropic = Effect.fn("serverMetrics.serveFakeAnthropic")(function* (
+export const serveFakeAnthropic = Effect.fn("serverMetrics.serveFakeAnthropic")(function* (
   capturePayload = false,
 ) {
   const requests: ApiRequest[] = [];
   const app = Effect.gen(function* () {
     const request = yield* HttpServerRequest.HttpServerRequest;
-    if (request.url.includes("count_tokens")) {
+    const route = request.url.split("?")[0] ?? "";
+    const tokenCount = route === "/v1/messages/count_tokens";
+    if (tokenCount && !capturePayload) {
       return HttpServerResponse.jsonUnsafe({ input_tokens: 100 });
     }
     if (!request.url.startsWith("/v1/messages")) {
@@ -268,19 +270,22 @@ const serveFakeAnthropic = Effect.fn("serverMetrics.serveFakeAnthropic")(functio
     const body = yield* decodeJson(MessagesRequest)(raw).pipe(
       Effect.orElseSucceed((): typeof MessagesRequest.Type => ({})),
     );
-    const streamed = body.stream === true;
-    const toolResult = endsInToolResult(body.messages);
+    const streamed = !tokenCount && body.stream === true;
+    const toolResult = !tokenCount && endsInToolResult(body.messages);
     const entry: ApiRequest = {
       toolResult,
       at: yield* nowMs,
       stream: streamed,
-      ...(capturePayload ? { payload: measureModelPayload(raw, body) } : {}),
+      ...(capturePayload ? { payload: { route, ...measureModelPayload(raw, body) } } : {}),
       // Title and branch-name jobs carry only their structured-output tool; the agent carries many.
       agent: streamed && (body.tools?.length ?? 0) > 1,
       // A follow-up carries the thread's earlier prompts too, so the newest marker is the turn's.
       marker: [...raw.matchAll(/bench-run-\d+/g)].at(-1)?.[0],
     };
     requests.push(entry);
+    if (tokenCount) {
+      return HttpServerResponse.jsonUnsafe({ input_tokens: 100 });
+    }
     const model = body.model ?? MODEL;
     const id = `msg_bench_${requests.length}`;
     if (!streamed) {

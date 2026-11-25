@@ -162,9 +162,13 @@ function geminiResponse() {
 
 export async function startModelEndpoint(provider: Provider) {
   const requests: Sample[] = [];
-  const unexpected = new Set<string>();
+  const failures = new Set<string>();
   const server = NodeHttp.createServer(async (request, response) => {
     const route = request.url?.split("?")[0] ?? "";
+    const reject = (status: number) => {
+      failures.add(`${request.method} ${route} (${status})`);
+      if (!response.headersSent) response.writeHead(status).end();
+    };
     const gemini = /^\/v1beta\/models\/([\w.-]+):(streamGenerateContent|generateContent)$/.exec(
       route,
     );
@@ -175,8 +179,7 @@ export async function startModelEndpoint(provider: Provider) {
         ? route === "/v1/responses"
         : anthropic || (provider === "antigravity" && gemini !== null);
     if (request.method !== "POST" || !known) {
-      unexpected.add(`${request.method} ${route}`);
-      response.writeHead(404).end();
+      reject(404);
       return;
     }
     try {
@@ -185,7 +188,7 @@ export async function startModelEndpoint(provider: Provider) {
       for await (const chunk of request) {
         bytes += chunk.length;
         if (bytes > 4 * 1024 * 1024) {
-          response.writeHead(413).end();
+          reject(413);
           return;
         }
         chunks.push(chunk);
@@ -194,7 +197,7 @@ export async function startModelEndpoint(provider: Provider) {
       const body = record(JSON.parse(raw));
       const model = gemini?.[1] ?? body?.model;
       if (body === undefined || typeof model !== "string") {
-        response.writeHead(400).end();
+        reject(400);
         return;
       }
       requests.push({ bytes, route, model, raw, body });
@@ -228,7 +231,7 @@ export async function startModelEndpoint(provider: Provider) {
               : sse([geminiResponse()]),
         );
     } catch {
-      response.writeHead(400).end();
+      reject(400);
     }
   });
   await new Promise<void>((resolve, reject) => {
@@ -243,8 +246,12 @@ export async function startModelEndpoint(provider: Provider) {
     throw new Error("Missing model endpoint TCP address");
   return {
     port: address.port,
-    requests,
-    unexpected,
+    readRequests: (start = 0) => {
+      if (failures.size > 0) {
+        throw new Error(`Model endpoint rejected requests: ${[...failures].join(", ")}`);
+      }
+      return requests.slice(start);
+    },
     close: () =>
       new Promise<void>((resolve, reject) => {
         server.close((error) => (error ? reject(error) : resolve()));

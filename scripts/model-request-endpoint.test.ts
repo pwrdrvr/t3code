@@ -1,5 +1,14 @@
+import { it as effectIt } from "@effect/vitest";
+import * as Effect from "effect/Effect";
+import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/http";
 import { expect, it } from "vite-plus/test";
-import { ANSWER, FIRST_PROMPT, NEXT_PROMPT, measureTurn } from "./model-request-endpoint.ts";
+import {
+  ANSWER,
+  FIRST_PROMPT,
+  NEXT_PROMPT,
+  measureTurn,
+  startModelEndpoint,
+} from "./model-request-endpoint.ts";
 
 function sample(model: string, body: Record<string, unknown>) {
   const raw = JSON.stringify(body);
@@ -44,3 +53,30 @@ it("requires a follow-up body to contain the previous user prompt and answer", (
       .calls,
   ).toBe(1);
 });
+
+effectIt.live(
+  "fails measurement after a rejected auxiliary request even if the agent request succeeds",
+  () =>
+    Effect.gen(function* () {
+      const endpoint = yield* Effect.acquireRelease(
+        Effect.promise(() => startModelEndpoint("claude")),
+        (endpoint) => Effect.promise(() => endpoint.close()),
+      );
+      const messages = [{ role: "user", content: FIRST_PROMPT }];
+      const send = (route: string, body: string) =>
+        HttpClient.execute(
+          HttpClientRequest.post(`http://127.0.0.1:${endpoint.port}${route}`).pipe(
+            HttpClientRequest.bodyText(body),
+          ),
+        );
+      const oversized = yield* send("/v1/messages/count_tokens", "x".repeat(4 * 1024 * 1024 + 1));
+      expect(oversized.status).toBe(413);
+      const malformed = yield* send("/v1/messages/count_tokens", "{");
+      expect(malformed.status).toBe(400);
+      const reply = yield* send("/v1/messages", JSON.stringify({ model: "fixture", messages }));
+      expect(reply.status).toBe(200);
+      expect(yield* reply.text).toContain(ANSWER);
+      expect(() => endpoint.readRequests()).toThrow("/v1/messages/count_tokens (413)");
+      expect(() => endpoint.readRequests()).toThrow("/v1/messages/count_tokens (400)");
+    }).pipe(Effect.scoped, Effect.provide(FetchHttpClient.layer)),
+);

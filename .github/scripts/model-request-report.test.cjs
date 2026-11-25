@@ -103,14 +103,16 @@ test("renders exact byte deltas, exceeded budgets and a changed ceiling", () => 
   const current = result(1200);
   const baseline = result();
   current.results[0].ceilings.first.bytes = 1150;
-  const body = renderComment({
+  const report = {
     current,
     baseline,
-    exactBase: true,
+    runBaseSha: baseSha,
+    pullBaseSha: baseSha,
     source: { sha: headSha, id: 12, number: 12, attempt: 1, conclusion: "failure" },
     baselineRun: { sha: baseSha, id: 5 },
     runUrl: (id) => `https://github.com/org/t3code/actions/runs/${id}`,
-  });
+  };
+  const body = renderComment(report);
   assert.match(
     body,
     /Codex \| First turn \| Total body bytes \| 1,000 \| 1,200 \| \+200 \(\+20\.0%\) \| 1,150 \| ❌/,
@@ -118,6 +120,26 @@ test("renders exact byte deltas, exceeded budgets and a changed ceiling", () => 
   assert.match(body, /Ceiling changes/);
   assert.match(body, /Primary request and auxiliary call breakdown/);
   assert.doesNotMatch(body, /latest available/);
+  assert.match(
+    renderComment({ ...report, runBaseSha: undefined }),
+    /GitHub did not report the base for this CI run\. Deltas use the current PR base\./,
+  );
+  assert.match(
+    renderComment({ ...report, runBaseSha: headSha }),
+    /The exact base has no usable measurement/,
+  );
+  assert.match(
+    renderComment({ ...report, baseline: undefined, runBaseSha: undefined }),
+    /GitHub did not report the base for this CI run/,
+  );
+  assert.match(
+    renderComment({ ...report, baseline: undefined }),
+    /No usable `main` measurement was found for the CI run's base/,
+  );
+  assert.match(
+    renderComment({ ...report, source: { ...report.source, attempt: 2, measurementAttempt: 1 } }),
+    /Model measurement from attempt 1/,
+  );
 });
 
 test("resolves fork heads without an associated PR and uses successful main baselines", async () => {
@@ -131,12 +153,12 @@ test("resolves fork heads without an associated PR and uses successful main base
     rest: {
       pulls: { list: () => {} },
       actions: {
-        listWorkflowRunArtifacts: async ({ run_id }) => ({
+        listWorkflowRunArtifacts: async ({ run_id, name }) => ({
           data: {
             artifacts: [
               {
                 id: run_id + 100,
-                name: "model-request-results",
+                name,
                 expired: false,
                 size_in_bytes: 100,
               },
@@ -146,7 +168,16 @@ test("resolves fork heads without an associated PR and uses successful main base
         listWorkflowRuns: async (filters) => {
           exactFilters.push(filters);
           return {
-            data: { workflow_runs: [{ id: 5, head_sha: baseSha, head_repository: { id: 1 } }] },
+            data: {
+              workflow_runs: [
+                {
+                  id: filters.head_sha ? 5 : 6,
+                  head_sha: filters.head_sha ?? "3".repeat(40),
+                  head_repository: { id: 1 },
+                  run_attempt: 1,
+                },
+              ],
+            },
           };
         },
       },
@@ -164,14 +195,86 @@ test("resolves fork heads without an associated PR and uses successful main base
   assert.deepEqual(outputs, {
     pull: 8,
     current_artifact: 112,
+    current_attempt: 1,
     baseline_artifact: 105,
     baseline_run: 5,
     baseline_sha: baseSha,
-    exact_base: false,
+    run_base_sha: "",
+    pr_base_sha: baseSha,
   });
-  assert.deepEqual(exactFilters, [
-    { ...repo, workflow_id: 4, branch: "main", event: "push", status: "success", per_page: 10 },
-  ]);
+  const filters = {
+    ...repo,
+    workflow_id: 4,
+    branch: "main",
+    event: "push",
+    status: "success",
+    per_page: 10,
+  };
+  assert.deepEqual(exactFilters, [{ ...filters, head_sha: baseSha }, filters]);
+});
+
+test("uses an earlier attempt's artifact only if the benchmark did not rerun", async () => {
+  for (const [artifactOnRetry, benchmarkReran, expected, expectedAttempt] of [
+    [true, true, 102, 2],
+    [false, true, "", ""],
+    [false, false, 101, 1],
+  ]) {
+    const outputs = {};
+    const listJobs = () => {};
+    const github = {
+      paginate: async (endpoint, filters) => {
+        assert.equal(endpoint, listJobs);
+        assert.equal(filters.attempt_number, 2);
+        return benchmarkReran ? [{ name: "Model request budget" }] : [{ name: "Lint" }];
+      },
+      rest: {
+        pulls: { get: async () => ({ data: pull }) },
+        actions: {
+          listJobsForWorkflowRunAttempt: listJobs,
+          listWorkflowRunArtifacts: async ({ name }) => ({
+            data: {
+              artifacts: [
+                { id: 101, name: "model-request-results-1", expired: false, size_in_bytes: 100 },
+                ...(artifactOnRetry
+                  ? [
+                      {
+                        id: 102,
+                        name: "model-request-results-2",
+                        expired: false,
+                        size_in_bytes: 100,
+                      },
+                    ]
+                  : []),
+              ].filter((artifact) => artifact.name === name),
+            },
+          }),
+          listWorkflowRuns: async () => ({ data: { workflow_runs: [] } }),
+        },
+      },
+    };
+    await resolve({
+      github,
+      context: {
+        repo,
+        payload: {
+          repository: source.repository,
+          workflow_run: {
+            ...source,
+            run_attempt: 2,
+            pull_requests: [{ number: pull.number, base: { sha: baseSha } }],
+          },
+        },
+      },
+      core: {
+        setOutput: (name, value) => {
+          outputs[name] = value;
+        },
+      },
+    });
+    assert.equal(outputs.current_artifact, expected);
+    assert.equal(outputs.current_attempt, expectedAttempt);
+    assert.equal(outputs.run_base_sha, baseSha);
+  }
 });
 
 test("does not publish after a head moves or replace an existing result with a missing report", async () => {

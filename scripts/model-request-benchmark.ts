@@ -84,6 +84,27 @@ const DUMMY_KEY = "fixture-key";
 const encodeJson = Schema.encodeEffect(fromJsonStringPretty(Schema.Unknown));
 const decodeProvider = Schema.decodeUnknownEffect(Schema.Literals(PROVIDERS));
 
+const BudgetValue = Schema.Int.check(
+  Schema.isGreaterThanOrEqualTo(0),
+  Schema.isLessThan(1_000_000_000),
+);
+const BudgetMetrics = Schema.Struct({
+  bytes: BudgetValue,
+  calls: BudgetValue,
+  primaryBytes: BudgetValue,
+  inputBytes: BudgetValue,
+  instructionBytes: BudgetValue,
+  toolBytes: BudgetValue,
+  auxiliaryBytes: BudgetValue,
+  auxiliaryCalls: BudgetValue,
+});
+const BudgetTurns = Schema.Struct({ first: BudgetMetrics, next: BudgetMetrics });
+const BudgetCeilings = Schema.Record(Schema.Literals(PROVIDERS), BudgetTurns);
+const budgetMetrics = Schema.decodeUnknownSync(BudgetMetrics);
+export const decodeBudgetCeilings = Schema.decodeUnknownEffect(BudgetCeilings, {
+  onExcessProperty: "error",
+});
+
 const runResult = Schema.decodeUnknownEffect(
   Schema.fromJsonString(
     Schema.Struct({
@@ -192,10 +213,7 @@ const capture = Effect.fn("modelRequest.capture")(function* (
         ? { homePath: env.CLAUDE_CONFIG_DIR }
         : { authMethod: "gemini-api-key", apiKey: DUMMY_KEY };
   const snapshot = (start: number, prompt: string, followUp: boolean) => {
-    if (endpoint.unexpected.size > 0) {
-      throw new Error(`Unexpected model endpoint routes: ${[...endpoint.unexpected].join(", ")}`);
-    }
-    const requests = endpoint.requests.slice(start);
+    const requests = endpoint.readRequests(start);
     return {
       ...measureTurn(requests, model, prompt, followUp),
       ...(includeRaw ? { rawRequests: requests.map(({ raw }) => raw) } : {}),
@@ -237,7 +255,7 @@ const capture = Effect.fn("modelRequest.capture")(function* (
       },
     },
   ).pipe(Effect.timeout("45 seconds"));
-  if (endpoint.requests.length > 0) {
+  if (endpoint.readRequests().length > 0) {
     return yield* new MetricsError({
       message: `${provider} made a model call before the first turn`,
     });
@@ -258,7 +276,7 @@ const capture = Effect.fn("modelRequest.capture")(function* (
     ])
     .pipe(Effect.timeout("60 seconds"), Effect.flatMap(assertT3Reply));
   const first = snapshot(0, FIRST_PROMPT, false);
-  const start = endpoint.requests.length;
+  const start = first.calls;
   yield* server
     .cli(["thread", "send", "--wait", "--json", threadId, NEXT_PROMPT])
     .pipe(Effect.timeout("60 seconds"), Effect.flatMap(assertT3Reply));
@@ -275,34 +293,12 @@ type Comparison = {
   cli: Capture | undefined;
 };
 
-function budgetMetrics(turn: Capture[number]) {
-  const {
-    bytes,
-    calls,
-    primaryBytes,
-    inputBytes,
-    instructionBytes,
-    toolBytes,
-    auxiliaryBytes,
-    auxiliaryCalls,
-  } = turn;
-  return {
-    bytes,
-    calls,
-    primaryBytes,
-    inputBytes,
-    instructionBytes,
-    toolBytes,
-    auxiliaryBytes,
-    auxiliaryCalls,
-  };
-}
-
 const writeBudget = Effect.fn("modelRequest.writeBudget")(function* (
   file: string,
   comparisons: readonly Comparison[],
 ) {
   const fs = yield* FileSystem.FileSystem;
+  const budgetCeilings = yield* decodeBudgetCeilings(ceilings);
   const results = [];
   const failures: string[] = [];
   for (const { provider, t3 } of comparisons) {
@@ -310,7 +306,7 @@ const writeBudget = Effect.fn("modelRequest.writeBudget")(function* (
     if (!first || !next)
       return yield* new MetricsError({ message: `Missing T3 turns for ${provider}` });
     const observed = { first: budgetMetrics(first), next: budgetMetrics(next) };
-    const limits = ceilings[provider];
+    const limits = budgetCeilings[provider];
     for (const phase of ["first", "next"] as const) {
       for (const [key, ceiling] of Object.entries(limits[phase])) {
         const value = observed[phase][key as keyof typeof limits.first];
