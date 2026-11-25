@@ -355,8 +355,7 @@ export const make = Effect.gen(function* () {
       "github.operation": input.operation,
     });
     const scope = yield* SourceControlRateLimit.CredentialScope;
-    // A refusal pauses the whole host, whichever quota it spent: the key PullRequestService
-    // records its own backoff under.
+    // REST and GraphQL share a provider cooldown for this host and credential.
     const key = { provider: SourceControlProviderKind.make("github"), host };
 
     // Settlement annotates the request span with status and rate-limit attributes.
@@ -410,19 +409,17 @@ export const make = Effect.gen(function* () {
       slots
         .withPermit(
           Effect.gen(function* () {
-            const lease = yield* quota
-              .admit(host, input.resource, { allowReserve: input.allowReserve })
-              .pipe(
-                Effect.andThen(
-                  limits.check(key, input.allowReserve ? { allowPaused: true } : undefined),
-                ),
-                Effect.tapError((paused) =>
-                  Effect.annotateCurrentSpan({
-                    "github.paused": true,
-                    "github.retry_at": paused.retryAt,
-                  }),
-                ),
-              );
+            const lease = yield* limits.check(key).pipe(
+              Effect.tap(() =>
+                quota.admit(host, input.resource, { allowReserve: input.allowReserve }),
+              ),
+              Effect.tapError((paused) =>
+                Effect.annotateCurrentSpan({
+                  "github.paused": true,
+                  "github.retry_at": paused.retryAt,
+                }),
+              ),
+            );
             // One deadline covers the headers and the body: a host that answers headers and then
             // stalls must not hold a shared slot for undici's own five-minute body timeout.
             const answer = yield* send(
