@@ -1,4 +1,10 @@
 import * as Effect from "effect/Effect";
+import * as Option from "effect/Option";
+import { HttpServerRequest } from "effect/http";
+import {
+  MCP_TOOL_EXPOSURE_COMPACT,
+  MCP_TOOL_EXPOSURE_HEADER,
+} from "@t3tools/provider-core/server/mcpSession";
 
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import * as McpToolAccess from "../../McpToolAccess.ts";
@@ -12,7 +18,11 @@ export const layer = McpToolAccess.toLayer(ToolSearchToolkit, {
         Effect.flatMap((scope) => McpInvocationContext.requireThreadScope(scope, "tool_search")),
       );
       const exposure = yield* McpToolExposure.McpToolExposure;
-      return { tools: yield* exposure.search(thread.providerSessionId, query) };
+      const request = Option.getOrUndefined(
+        yield* Effect.serviceOption(HttpServerRequest.HttpServerRequest),
+      );
+      const compact = request?.headers[MCP_TOOL_EXPOSURE_HEADER] === MCP_TOOL_EXPOSURE_COMPACT;
+      return { tools: yield* exposure.search(thread.providerSessionId, query, compact) };
     }),
   ),
 });

@@ -6,6 +6,9 @@ import type * as Effect from "effect/Effect";
  * lists only a core set plus `tool_search`, which lists the rest on demand.
  */
 export const MCP_TOOL_EXPOSURE_HEADER = "t3-tool-exposure";
+export const MCP_TOOL_EXPOSURE_BRIDGE_ENV = "T3_ACP_MCP_TOOL_EXPOSURE";
+export const MCP_TOOL_EXPOSURE_COMPACT = "compact";
+export const MCP_TOOL_EXPOSURE_THEME_BROKER = "theme-broker";
 
 export interface McpProviderSessionConfig {
   readonly environmentId: EnvironmentId;
