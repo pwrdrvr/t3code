@@ -245,6 +245,7 @@ const makeHarness = Effect.fn("makePullRequestSyncHarness")(function* (options: 
   const layerDependencies = Layer.mergeAll(
     Layer.mock(PullRequestService.PullRequestService)({
       withSharedProjectReads: (effect) => effect,
+      prepareLinkedSummaryReads: () => Effect.succeed(() => undefined),
       batchesReads: (input) => Effect.succeed(options.batchesReads?.(input) ?? true),
       summary,
       stack,

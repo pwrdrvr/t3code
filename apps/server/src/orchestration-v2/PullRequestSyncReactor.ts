@@ -508,19 +508,35 @@ export const make = Effect.gen(function* () {
       }
     }, Effect.withSpan("PullRequestSyncReactor.syncEntry"));
 
+    const needsFreshSummary = (key: string, entries: ReadonlyArray<LinkEntry>) =>
+      requested.has(key) ||
+      retryStacks.has(key) ||
+      entries.some(
+        ({ link }) => link.snapshot?.state === "merged" && link.snapshot.mergedAt == null,
+      );
+    const linkedSummaryRead = yield* pullRequests.prepareLinkedSummaryReads(
+      scope === "requested"
+        ? []
+        : [...groups].flatMap(([key, entries]) =>
+            isDue(key, entries, nowMs) &&
+            !needsFreshSummary(key, entries) &&
+            (pausedUntil.get(pauseKeyOf(entries[0]!)) ?? 0) <= nowMs
+              ? [referenceOf(entries[0]!)]
+              : [],
+          ),
+    );
     const syncGroup = Effect.fnUntraced(function* (key: string, entries: ReadonlyArray<LinkEntry>) {
       const first = entries[0]!;
       const ref = referenceOf(first);
       const refreshRequested = requested.has(key);
       // A held merged summary is served without asking the host, so a snapshot still missing its
       // merge time has to drop it or the slow-cadence re-read would hand back the same gap.
-      const missingMergedAt = entries.some(
-        (entry) => entry.link.snapshot?.state === "merged" && entry.link.snapshot.mergedAt == null,
-      );
-      // A stack retry reads past the cache, or it could get back the layer list it is retrying.
-      const invalidated = refreshRequested || missingMergedAt || retryStacks.has(key);
+      const invalidated = needsFreshSummary(key, entries);
       if (invalidated) yield* pullRequests.invalidate({ reference: ref });
-      const summary = yield* pullRequests.summary(ref, { recoverTransientFailure: false }).pipe(
+      const read =
+        (invalidated ? undefined : linkedSummaryRead(ref)) ??
+        pullRequests.summary(ref, { recoverTransientFailure: false });
+      const summary = yield* read.pipe(
         Effect.tapError((error) =>
           error.reason === "not-found" || error._tag === "PullRequestUnavailableError"
             ? Effect.sync(() => {
