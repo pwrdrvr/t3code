@@ -24,8 +24,9 @@ import {
   startModelEndpoint,
   type Provider,
 } from "./model-request-endpoint.ts";
+import { MetricsError } from "./metrics/core/run.ts";
+import { startServer } from "./metrics/server/server-metrics.ts";
 import { run } from "./scenarios/shell.ts";
-import { MetricsError, startServer } from "./server-metrics.ts";
 import ceilings from "./model-request-ceilings.json" with { type: "json" };
 
 const CONFIG = {
