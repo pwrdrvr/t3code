@@ -15,6 +15,7 @@ import {
 } from "@t3tools/client-runtime/user-message";
 import type { HandoffTimelineRun } from "@t3tools/client-runtime/handoff";
 import { renderCodexDirectivesForCopy } from "~/markdown/markdownText";
+import { isStandaloneBrowserCompletionItem } from "@t3tools/client-runtime/work-log/browser-completion";
 import {
   commandDisplayText,
   commandProgramName,
@@ -109,6 +110,7 @@ function singleToolCallLabel(entry: WorkLogEntry, resolve: MessageResolver): str
   if (entry.itemType === "reasoning") {
     return entry.detail?.trim().replace(/\s+/g, " ") || resolve(msg("Thought"));
   }
+  if (entry.toolCompletionTitle) return entry.toolCompletionTitle;
   const toolPresentation = resolveWorkEntryToolPresentation(entry, "completed", resolve);
   if (toolPresentation) return toolPresentation.displayName;
   const item = entry.structuredPayload;
@@ -153,6 +155,13 @@ export function workEntryDisplayLabel(
   resolve: MessageResolver = m,
 ) {
   if (entry.itemType === "system_notice") return entry.label;
+  if (
+    entry.toolCompletionTitle &&
+    entry.structuredPayload &&
+    isStandaloneBrowserCompletionItem(entry.structuredPayload)
+  ) {
+    return entry.toolCompletionTitle;
+  }
   if (entry.itemType === "reasoning" || entry.tone === "thinking") {
     const thought = entry.detail?.trim().replace(/\s+/g, " ");
     return thought || entry.label;
@@ -2062,7 +2071,9 @@ export function deriveMessagesTimelineRows(
         timelineEntry.entry.itemType === "system_notice" ||
         timelineEntry.entry.itemType === "notification" ||
         timelineEntry.entry.itemType === "todo_list" ||
-        timelineEntry.entry.questionAnswer !== undefined
+        timelineEntry.entry.questionAnswer !== undefined ||
+        (timelineEntry.entry.structuredPayload !== undefined &&
+          isStandaloneBrowserCompletionItem(timelineEntry.entry.structuredPayload))
       ) {
         nextRows.push({
           kind: "work",
@@ -2076,6 +2087,9 @@ export function deriveMessagesTimelineRows(
       const groupedEntries = [timelineEntry.entry];
       let cursor = index + 1;
       while (cursor < timelineEntries.length) {
+        if (groupedEntries.at(-1)?.toolCompletionTitle !== undefined) {
+          break;
+        }
         const nextEntry = timelineEntries[cursor];
         if (
           !nextEntry ||
@@ -2089,6 +2103,8 @@ export function deriveMessagesTimelineRows(
           nextEntry.entry.itemType === "notification" ||
           nextEntry.entry.itemType === "todo_list" ||
           nextEntry.entry.questionAnswer !== undefined ||
+          (nextEntry.entry.structuredPayload !== undefined &&
+            isStandaloneBrowserCompletionItem(nextEntry.entry.structuredPayload)) ||
           isPendingApproval(nextEntry.entry) ||
           activeWorkEntryIds.has(nextEntry.id) ||
           collapsedEntryIds.has(nextEntry.id) ||

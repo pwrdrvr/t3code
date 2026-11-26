@@ -2856,3 +2856,145 @@ it("keeps concurrent approvals actionable outside collapsed work and restores se
     .element(screen.getByRole("button", { name: "Open the current tab", exact: true }))
     .toBeVisible();
 });
+
+it("renders correlated and standalone Codex browser completion headlines without leaking raw directives", async () => {
+  setup();
+  const fixture = makeStreamingTimelineFixture();
+  const source = fixture.visibleTurnItems.find((row) => row.item.type === "dynamic_tool")!;
+  if (source.item.type !== "dynamic_tool") throw new Error("Expected tool fixture");
+  const browserSource = {
+    key: "browser-use:chrome",
+    name: "Chrome",
+    kind: "integration" as const,
+  };
+  const websiteIcon = {
+    _tag: "website" as const,
+    pageUrl: "https://platform.openai.com/usage",
+  };
+  const common = {
+    ...source.item,
+    threadId: fixture.threadId,
+    runId: fixture.runId,
+    status: "completed" as const,
+  };
+  const entries = deriveTimelineEntriesFromVisibleTurnItems({
+    visibleTurnItems: [
+      {
+        ...source,
+        sourceItemId: TurnItemId.make("browser-1"),
+        item: {
+          ...common,
+          id: TurnItemId.make("browser-1"),
+          ordinal: 1,
+          type: "dynamic_tool",
+          toolName: "node_repl.js",
+          title: "Open usage dashboard",
+          toolSurface: "browser",
+          toolIcon: websiteIcon,
+          toolSource: browserSource,
+          input: { title: "Open usage dashboard", code: "await page.goto(url);" },
+        },
+      },
+      {
+        ...source,
+        sourceItemId: TurnItemId.make("browser-2"),
+        item: {
+          ...common,
+          id: TurnItemId.make("browser-2"),
+          ordinal: 2,
+          type: "dynamic_tool",
+          toolName: "node_repl.js",
+          title: "Read current month totals",
+          toolSurface: "browser",
+          toolIcon: websiteIcon,
+          toolSource: browserSource,
+          input: { title: "Read current month totals", code: "await page.textContent('main');" },
+        },
+      },
+      {
+        ...source,
+        sourceItemId: TurnItemId.make("browser-complete-1"),
+        item: {
+          ...common,
+          id: TurnItemId.make("browser-complete-1"),
+          ordinal: 3,
+          type: "assistant_message",
+          phase: "commentary",
+          messageId: MessageId.make("msg-browser-complete-1"),
+          text: '::browser-complete{title="Verified recent OpenAI usage"}',
+          streaming: false,
+        },
+      },
+      {
+        ...source,
+        sourceItemId: TurnItemId.make("commentary-after"),
+        item: {
+          ...common,
+          id: TurnItemId.make("commentary-after"),
+          ordinal: 4,
+          type: "assistant_message",
+          phase: "commentary",
+          messageId: MessageId.make("msg-commentary-after"),
+          text: "Comparing the usage total with your local budget.",
+          streaming: false,
+        },
+      },
+      {
+        ...source,
+        sourceItemId: TurnItemId.make("browser-complete-standalone"),
+        item: {
+          ...common,
+          id: TurnItemId.make("browser-complete-standalone"),
+          ordinal: 5,
+          type: "assistant_message",
+          phase: "commentary",
+          messageId: MessageId.make("msg-browser-complete-standalone"),
+          text: '::browser-complete{title="Paused for a sign-in code"}',
+          streaming: false,
+        },
+      },
+      {
+        ...source,
+        sourceItemId: TurnItemId.make("final-answer"),
+        item: {
+          ...common,
+          id: TurnItemId.make("final-answer"),
+          ordinal: 6,
+          type: "assistant_message",
+          phase: "final_answer",
+          messageId: MessageId.make("msg-final-answer"),
+          text: "Please enter the 6-digit verification code sent to your email.",
+          streaming: false,
+        },
+      },
+    ],
+    optimisticMessages: [],
+  });
+
+  await using screen = await renderTimeline(entries, {
+    isWorking: true,
+    runningRunId: fixture.runId,
+  });
+  const browserGroupButton = screen.getByRole("button", {
+    name: "Verified recent OpenAI usage",
+    exact: true,
+  });
+  await expect.element(browserGroupButton).toBeVisible();
+  await expect
+    .element(screen.getByText("Comparing the usage total with your local budget."))
+    .toBeVisible();
+  await expect.element(screen.getByText("Paused for a sign-in code")).toBeVisible();
+  await expect
+    .element(screen.getByText("Please enter the 6-digit verification code sent to your email."))
+    .toBeVisible();
+  expect(screen.text()).not.toContain("::browser-complete");
+  expect(screen.buttons("Paused for a sign-in code")).toHaveLength(0);
+
+  await browserGroupButton.click();
+  await expect
+    .element(screen.getByRole("button", { name: "Open usage dashboard", exact: true }))
+    .toBeVisible();
+  await expect
+    .element(screen.getByRole("button", { name: "Read current month totals", exact: true }))
+    .toBeVisible();
+});

@@ -17,6 +17,10 @@ import {
   type ThreadId,
   type TurnItemId,
 } from "@t3tools/contracts";
+import {
+  isPotentialBrowserCompletionCommentary,
+  normalizeBrowserCompletionTurnItems,
+} from "@t3tools/client-runtime/work-log/browser-completion";
 import { extractToolActivityPresentation } from "@t3tools/client-runtime/work-log/tool-presentation";
 import { classifyToolActivity, collectToolFilePaths } from "@t3tools/shared/toolActivity";
 import { formatReadToolLabel, formatSearchToolLabel } from "@t3tools/shared/toolActivityCopy";
@@ -85,6 +89,7 @@ export interface WorkLogEntry {
   readonly toolSurface?: ToolActivitySurface;
   readonly toolIcon?: ToolActivityIcon;
   readonly toolSource?: ToolActivitySource;
+  readonly toolCompletionTitle?: string;
   readonly sourceActivityKind?: string;
   readonly taskId?: string;
   readonly agentRole?: string;
@@ -584,15 +589,16 @@ export function deriveTimelineEntriesFromVisibleTurnItems(
     return undefined;
   };
 
+  const visibleTurnItems = normalizeBrowserCompletionTurnItems(input.visibleTurnItems);
   // An answer that started a later run stays a normal message at that run's position.
   const foldedAnswerRunIdByMessageId = new Map<string, OrchestrationV2TurnItem["runId"]>(
-    input.visibleTurnItems.flatMap(({ item }) =>
+    visibleTurnItems.flatMap(({ item }) =>
       item.type === "user_input_request" && item.questionAnswer
         ? [[`async-answer:${item.questionAnswer.requestId}`, item.runId] as const]
         : [],
     ),
   );
-  for (const row of input.visibleTurnItems) {
+  for (const row of visibleTurnItems) {
     const { item } = row;
     if (turnItemIsWorkspacePreparation(item) && !item.deferredWork) continue;
     if (item.type === "checkpoint") continue;
@@ -988,7 +994,7 @@ function reuseTimelineEntries(
   ) {
     return null;
   }
-  // Answer rows can replace a message already present in the retained prefix.
+  // Answer rows and browser completion commentary can replace or fold into earlier entries.
   if (
     appended &&
     input.visibleTurnItems
@@ -996,7 +1002,8 @@ function reuseTimelineEntries(
       .some(
         ({ item }) =>
           (item.type === "user_input_request" && item.questionAnswer !== undefined) ||
-          (item.type === "user_message" && item.messageId.startsWith("async-answer:")),
+          (item.type === "user_message" && item.messageId.startsWith("async-answer:")) ||
+          isPotentialBrowserCompletionCommentary(item),
       )
   )
     return null;
@@ -1009,6 +1016,12 @@ function reuseTimelineEntries(
     const previousItem = before.visibleTurnItems[index]!;
     const item = input.visibleTurnItems[index]!;
     if (item === previousItem) continue;
+    if (
+      isPotentialBrowserCompletionCommentary(previousItem.item) ||
+      isPotentialBrowserCompletionCommentary(item.item)
+    ) {
+      return null;
+    }
     // Reasoning and plan text re-derive below; only assistant text patches the message.
     if (
       item.item.type === "assistant_message" &&

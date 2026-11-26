@@ -106,6 +106,7 @@ export interface WorkLogPresentationEntry {
   readonly toolSource?: ToolActivitySource;
   readonly toolSurface?: ToolActivitySurface;
   readonly toolIcon?: ToolActivityIcon;
+  readonly toolCompletionTitle?: string;
 }
 
 export type ToolGroupAction =
@@ -771,11 +772,17 @@ export function summarizeToolGroup(
     }
   >();
   const sources = new Map<string, ToolActivitySource>();
+  let browserCompletionTitle: string | undefined;
   for (const entry of entries) {
     const t3Action = resolveT3McpSummaryAction(
       workEntryToolName(entry),
       t3ToolSummaryCall(entry).input,
     );
+    const completionTitle =
+      entry.toolSurface === "browser" ? entry.toolCompletionTitle?.trim() : undefined;
+    if (completionTitle) {
+      browserCompletionTitle = completionTitle;
+    }
     if (entry.toolSource && t3Action === null) {
       sources.set(entry.toolSource.key, entry.toolSource);
       continue;
@@ -808,19 +815,29 @@ export function summarizeToolGroup(
   const labels = selected.map(({ label }) => label);
   if (sources.size > 0) {
     const sourceValues = [...sources.values()];
-    const sourceNames = [...new Set(sourceValues.map((source) => source.name))];
-    const names = joinClauses(sourceNames, resolve);
-    const allIntegrations = sourceValues.every((source) => source.kind === "integration");
-    labels.unshift(
-      allIntegrations
-        ? resolve(
-            msg(
-              "{count, plural, =1 {Used {names} integration} other {Used {names} integrations}}",
-              { count: sourceNames.length, names },
-            ),
-          )
-        : resolve(msg("Used {names}", { names })),
-    );
+    const remainingSources = browserCompletionTitle
+      ? sourceValues.filter(
+          (source) => source.kind !== "browser" && !source.key.startsWith("browser-use:"),
+        )
+      : sourceValues;
+    if (remainingSources.length > 0) {
+      const sourceNames = [...new Set(remainingSources.map((source) => source.name))];
+      const names = joinClauses(sourceNames, resolve);
+      const allIntegrations = remainingSources.every((source) => source.kind === "integration");
+      labels.unshift(
+        allIntegrations
+          ? resolve(
+              msg(
+                "{count, plural, =1 {Used {names} integration} other {Used {names} integrations}}",
+                { count: sourceNames.length, names },
+              ),
+            )
+          : resolve(msg("Used {names}", { names })),
+      );
+    }
+  }
+  if (browserCompletionTitle) {
+    labels.unshift(browserCompletionTitle);
   }
   const sourcedCount = entries.filter(
     (entry) =>

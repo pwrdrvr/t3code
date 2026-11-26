@@ -52,6 +52,11 @@ import { SKILL_MENTION_PATTERN } from "@t3tools/shared/composerInlineTokens";
 import { AgentScope } from "@t3tools/shared/AgentScope";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import {
+  BROWSER_USE_FALLBACK_TOOL_SOURCE,
+  isPendingCodexBrowserCompletion,
+  parseCodexBrowserCompletion,
+} from "@t3tools/shared/codexBrowserCompletion";
+import {
   COMPUTER_USE_TOOL_SOURCE,
   dynamicToolSurface,
   dynamicToolTitle,
@@ -1469,6 +1474,10 @@ interface ActiveCodexTurnContext {
   readonly fileChangeKindsByItem: Map<string, CodexFileChangeKinds>;
   readonly messagePhases: Map<string, "commentary" | "partial_answer" | "final_answer">;
   readonly asyncMessageIds: Set<string>;
+  readonly bufferedBrowserCompletionIds: Set<string>;
+  latestBrowserActivity?:
+    | Extract<OrchestrationV2TurnItem, { readonly type: "dynamic_tool" }>
+    | undefined;
   readonly itemPositions: Map<
     string,
     { readonly ordinal: number; readonly startedAt: DateTime.Utc }
@@ -2800,6 +2809,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             fileChangeKindsByItem: new Map(),
             messagePhases: new Map(),
             asyncMessageIds: new Set(),
+            bufferedBrowserCompletionIds: new Set(),
             runningCompactionItemIds: new Set(),
             runningWebSearchItems: new Map(),
           };
@@ -3514,6 +3524,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               fileChangeKindsByItem: new Map(),
               messagePhases: new Map(),
               asyncMessageIds: new Set(),
+              bufferedBrowserCompletionIds: new Set(),
               runningCompactionItemIds: new Set(),
               runningWebSearchItems: new Map(),
             };
@@ -4203,6 +4214,62 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           return { node, message, turnItem };
         });
 
+        const buildBrowserCompletionActivityArtifacts = Effect.fnUntraced(function* (
+          context: ActiveCodexTurnContext,
+          item: { readonly id: string; readonly headline: string },
+        ) {
+          const updatedAt = yield* DateTime.now;
+          const nodeId = idAllocator.derive.nodeFromProviderItem({
+            driver: CODEX_PROVIDER,
+            nativeItemId: item.id,
+          });
+          const { ordinal, startedAt } = yield* resolveItemPosition(context, item.id);
+          const turnItemId = idAllocator.derive.turnItemFromProviderItem({
+            driver: CODEX_PROVIDER,
+            nativeItemId: item.id,
+          });
+          const node: OrchestrationV2ExecutionNode = {
+            id: nodeId,
+            threadId: context.projectionThreadId,
+            runId: context.projectionRunId,
+            parentNodeId: context.itemParentNodeId,
+            rootNodeId: context.rootNodeId,
+            kind: "tool_call",
+            status: "completed",
+            countsForRun: false,
+            providerThreadId: context.providerThread.id,
+            providerTurnId: context.providerTurnId,
+            nativeItemRef: codexNativeItemRef(item.id),
+            runtimeRequestId: null,
+            checkpointScopeId: null,
+            startedAt,
+            completedAt: updatedAt,
+          };
+          const turnItem: Extract<OrchestrationV2TurnItem, { readonly type: "dynamic_tool" }> = {
+            id: turnItemId,
+            threadId: context.projectionThreadId,
+            runId: context.projectionRunId,
+            nodeId,
+            providerThreadId: context.providerThread.id,
+            providerTurnId: context.providerTurnId,
+            nativeItemRef: codexNativeItemRef(item.id),
+            parentItemId: null,
+            ordinal,
+            status: "completed",
+            title: item.headline,
+            toolCompletionTitle: item.headline,
+            toolSurface: "browser",
+            toolSource: BROWSER_USE_FALLBACK_TOOL_SOURCE,
+            startedAt,
+            completedAt: updatedAt,
+            updatedAt,
+            type: "dynamic_tool",
+            toolName: null,
+            input: null,
+          };
+          return { node, turnItem };
+        });
+
         // Coalesce token bursts to avoid a database write per token.
         const reasoningParts = new Map<
           string,
@@ -4302,6 +4369,63 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               const context = yield* awaitActiveTurn(update.turnId);
               if (context === undefined) {
                 return;
+              }
+              const phase = context.messagePhases.get(update.itemId);
+              if (phase === "commentary") {
+                if (!update.completed) {
+                  if (isPendingCodexBrowserCompletion(update.text)) {
+                    context.bufferedBrowserCompletionIds.add(update.itemId);
+                    return;
+                  }
+                  context.bufferedBrowserCompletionIds.delete(update.itemId);
+                  context.latestBrowserActivity = undefined;
+                } else {
+                  const completion = parseCodexBrowserCompletion(update.text);
+                  if (completion !== null) {
+                    context.bufferedBrowserCompletionIds.delete(update.itemId);
+                    const correlated = context.latestBrowserActivity;
+                    if (correlated !== undefined) {
+                      const updatedBrowserItem = {
+                        ...correlated,
+                        toolCompletionTitle: completion.headline,
+                        updatedAt: yield* DateTime.now,
+                      };
+                      context.latestBrowserActivity = updatedBrowserItem;
+                      yield* emitProviderEvent({
+                        type: "turn_item.updated",
+                        driver: CODEX_PROVIDER,
+                        turnItem: updatedBrowserItem,
+                      });
+                      return;
+                    }
+                    const artifacts = yield* buildBrowserCompletionActivityArtifacts(context, {
+                      id: update.itemId,
+                      headline: completion.headline,
+                    });
+                    yield* emitProviderEvent({
+                      type: "node.updated",
+                      driver: CODEX_PROVIDER,
+                      node: artifacts.node,
+                    });
+                    yield* emitProviderEvent({
+                      type: "turn_item.updated",
+                      driver: CODEX_PROVIDER,
+                      turnItem: artifacts.turnItem,
+                    });
+                    return;
+                  }
+                  const wasBuffered = context.bufferedBrowserCompletionIds.delete(update.itemId);
+                  if (
+                    wasBuffered &&
+                    (yield* Ref.get(terminalizedNonCompletedNativeTurns)).has(update.turnId) &&
+                    update.text.trimStart().startsWith("::browser-complete")
+                  ) {
+                    return;
+                  }
+                  context.latestBrowserActivity = undefined;
+                }
+              } else if (update.text.trim().length > 0) {
+                context.latestBrowserActivity = undefined;
               }
               const finalAnswerItem = (yield* Ref.get(finalAnswerItemIdsByTurn))
                 .get(update.turnId)
@@ -5831,6 +5955,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             }
 
             if (payload.item.type === "fileChange") {
+              context.latestBrowserActivity = undefined;
               context.fileChangeKindsByItem.set(
                 payload.item.id,
                 Object.fromEntries(payload.item.changes.map(({ path, kind }) => [path, kind])),
@@ -5855,6 +5980,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             }
 
             if (payload.item.type === "imageGeneration") {
+              context.latestBrowserActivity = undefined;
               if (!(yield* Ref.get(interruptingNativeTurns)).has(payload.turnId)) {
                 imageTurn(payload.turnId).running.set(payload.item.id, {
                   revisedPrompt: payload.item.revisedPrompt ?? null,
@@ -5867,6 +5993,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             }
 
             if (payload.item.type === "commandExecution") {
+              context.latestBrowserActivity = undefined;
               if (!codexItemStatus(payload.item.status).completed) {
                 yield* trackRunningCommandItem(payload.turnId, {
                   id: payload.item.id,
@@ -5923,6 +6050,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               return;
             }
 
+            context.latestBrowserActivity = undefined;
             context.runningWebSearchItems.set(payload.item.id, payload.item);
             const artifacts = yield* buildWebSearchArtifacts({
               context,
@@ -6089,6 +6217,11 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 return;
               }
               const artifacts = yield* buildDynamicToolArtifacts(context, payload.item);
+              context.latestBrowserActivity =
+                artifacts.turnItem.type === "dynamic_tool" &&
+                artifacts.turnItem.toolSurface === "browser"
+                  ? artifacts.turnItem
+                  : undefined;
               yield* emitProviderEvent({
                 type: "node.updated",
                 driver: CODEX_PROVIDER,
@@ -6106,6 +6239,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             }
 
             if (payload.item.type === "fileChange") {
+              context.latestBrowserActivity = undefined;
               context.fileChangeKindsByItem.delete(payload.item.id);
               const artifacts = yield* buildFileChangeArtifacts(context, payload.item);
               if (artifacts === null) {
@@ -6125,6 +6259,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             }
 
             if (payload.item.type === "webSearch") {
+              context.latestBrowserActivity = undefined;
               context.runningWebSearchItems.delete(payload.item.id);
               const artifacts = yield* buildWebSearchArtifacts({
                 context,
@@ -6145,6 +6280,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             }
 
             if (payload.item.type === "plan") {
+              context.latestBrowserActivity = undefined;
               yield* planDeltas.complete({
                 turnId: payload.turnId,
                 itemId: payload.item.id,
@@ -6195,6 +6331,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             }
 
             if (payload.item.type === "imageView") {
+              context.latestBrowserActivity = undefined;
               const artifacts = yield* buildDynamicToolArtifacts(context, {
                 type: "dynamicToolCall",
                 id: payload.item.id,
@@ -7880,6 +8017,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             fileChangeKindsByItem: new Map(),
             messagePhases: new Map(),
             asyncMessageIds: new Set(),
+            bufferedBrowserCompletionIds: new Set(),
             runningCompactionItemIds: new Set(),
             runningWebSearchItems: new Map(),
           };

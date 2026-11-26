@@ -14047,6 +14047,475 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       ),
     );
   });
+
+  describe("browser completion commentary", () => {
+    it.effect(
+      "buffers partial markers across interleaved MCP progress, correlates to browser metadata, and preserves subsequent work",
+      () =>
+        Effect.gen(function* () {
+          const scenario = "codex-browser-completion-correlated";
+          const nativeThreadId = `native-${scenario}`;
+          const nativeTurnId = `turn-${scenario}`;
+          const prompt = "Check my recent OpenAI usage.";
+          const browserToolItem = (status: "inProgress" | "completed") => ({
+            type: "mcpToolCall" as const,
+            id: "browser-call-1",
+            server: "node_repl",
+            tool: "js",
+            status,
+            arguments: { title: "Open OpenAI usage page", code: "await page.goto(url);" },
+            ...(status === "completed"
+              ? {
+                  result: {
+                    content: [{ type: "text", text: "Usage: $42.10" }],
+                    _meta: {
+                      "codex/toolSurface": {
+                        kind: "browserUse",
+                        backend: "chrome",
+                        browserFamily: "chrome",
+                        screenshot: { pageUrl: "https://platform.openai.com/usage" },
+                      },
+                    },
+                  },
+                }
+              : {}),
+          });
+
+          const transcript = makeCodexReplayTranscript({
+            scenario,
+            entries: [
+              ...codexReplayPreamble({ nativeThreadId, nativeTurnId, prompt }),
+              {
+                type: "emit_inbound",
+                label: "browser tool started",
+                frame: {
+                  method: "item/started",
+                  params: {
+                    item: browserToolItem("inProgress"),
+                    threadId: nativeThreadId,
+                    turnId: nativeTurnId,
+                    startedAtMs: 1782622440500,
+                  },
+                },
+              },
+              {
+                type: "emit_inbound",
+                label: "browser tool completed",
+                frame: {
+                  method: "item/completed",
+                  params: {
+                    item: browserToolItem("completed"),
+                    threadId: nativeThreadId,
+                    turnId: nativeTurnId,
+                    completedAtMs: 1782622441500,
+                  },
+                },
+              },
+              {
+                type: "emit_inbound",
+                label: "browser completion commentary started",
+                frame: {
+                  method: "item/started",
+                  params: {
+                    item: {
+                      type: "agentMessage",
+                      id: "msg-browser-complete",
+                      text: "",
+                      phase: "commentary",
+                    },
+                    threadId: nativeThreadId,
+                    turnId: nativeTurnId,
+                    startedAtMs: 1782622441600,
+                  },
+                },
+              },
+              {
+                type: "emit_inbound",
+                label: "partial marker delta 1",
+                frame: {
+                  method: "item/agentMessage/delta",
+                  params: {
+                    threadId: nativeThreadId,
+                    turnId: nativeTurnId,
+                    itemId: "msg-browser-complete",
+                    delta: '::browser-complete{title="Verified ',
+                  },
+                },
+              },
+              {
+                type: "emit_inbound",
+                label: "interleaved MCP progress notification",
+                frame: {
+                  method: "item/mcpToolCall/progress",
+                  params: {
+                    threadId: nativeThreadId,
+                    turnId: nativeTurnId,
+                    itemId: "browser-call-1",
+                    message: "Capturing final tab state",
+                  },
+                },
+              },
+              {
+                type: "emit_inbound",
+                label: "partial marker delta 2",
+                frame: {
+                  method: "item/agentMessage/delta",
+                  params: {
+                    threadId: nativeThreadId,
+                    turnId: nativeTurnId,
+                    itemId: "msg-browser-complete",
+                    delta: 'recent OpenAI usage"}',
+                  },
+                },
+              },
+              {
+                type: "emit_inbound",
+                label: "browser completion commentary completed",
+                frame: {
+                  method: "item/completed",
+                  params: {
+                    item: {
+                      type: "agentMessage",
+                      id: "msg-browser-complete",
+                      text: '::browser-complete{title="Verified recent OpenAI usage"}',
+                      phase: "commentary",
+                    },
+                    threadId: nativeThreadId,
+                    turnId: nativeTurnId,
+                    completedAtMs: 1782622441900,
+                  },
+                },
+              },
+              {
+                type: "emit_inbound",
+                label: "subsequent commentary started",
+                frame: {
+                  method: "item/started",
+                  params: {
+                    item: {
+                      type: "agentMessage",
+                      id: "msg-after-browser",
+                      text: "",
+                      phase: "commentary",
+                    },
+                    threadId: nativeThreadId,
+                    turnId: nativeTurnId,
+                    startedAtMs: 1782622442000,
+                  },
+                },
+              },
+              {
+                type: "emit_inbound",
+                label: "subsequent commentary completed",
+                frame: {
+                  method: "item/completed",
+                  params: {
+                    item: {
+                      type: "agentMessage",
+                      id: "msg-after-browser",
+                      text: "Comparing the usage total with your budget file.",
+                      phase: "commentary",
+                    },
+                    threadId: nativeThreadId,
+                    turnId: nativeTurnId,
+                    completedAtMs: 1782622442100,
+                  },
+                },
+              },
+              {
+                type: "emit_inbound",
+                label: "final answer with literal directive example",
+                frame: {
+                  method: "item/started",
+                  params: {
+                    item: {
+                      type: "agentMessage",
+                      id: "msg-final",
+                      text: "",
+                      phase: "final_answer",
+                    },
+                    threadId: nativeThreadId,
+                    turnId: nativeTurnId,
+                    startedAtMs: 1782622442200,
+                  },
+                },
+              },
+              {
+                type: "emit_inbound",
+                label: "final answer completed",
+                frame: {
+                  method: "item/completed",
+                  params: {
+                    item: {
+                      type: "agentMessage",
+                      id: "msg-final",
+                      text: '::browser-complete{title="Literal example in final answer"}',
+                      phase: "final_answer",
+                    },
+                    threadId: nativeThreadId,
+                    turnId: nativeTurnId,
+                    completedAtMs: 1782622442300,
+                  },
+                },
+              },
+              {
+                type: "emit_inbound",
+                label: "turn/completed",
+                frame: {
+                  method: "turn/completed",
+                  params: {
+                    threadId: nativeThreadId,
+                    turn: makeCodexReplayTurn({ id: nativeTurnId, status: "completed" }),
+                  },
+                },
+              },
+            ],
+          });
+
+          const harness = yield* makeCodexReplayHarness(transcript);
+          const now = yield* DateTime.now;
+          yield* harness.runtime.startTurn(
+            makeCodexTestTurnInput({
+              threadId: harness.threadId,
+              providerThread: harness.providerThread,
+              now,
+              attemptId: RunAttemptId.make("attempt-codex-browser-completion"),
+              text: prompt,
+            }),
+          );
+          yield* harness.firstTerminal;
+
+          const assistantItems = harness.events.flatMap((event) =>
+            event.type === "turn_item.updated" && event.turnItem.type === "assistant_message"
+              ? [event.turnItem]
+              : [],
+          );
+          assert.isFalse(
+            assistantItems.some((item) => item.nativeItemRef?.nativeId === "msg-browser-complete"),
+            "completion directive must never emit an assistant_message item",
+          );
+          assert.isTrue(
+            assistantItems.some(
+              (item) =>
+                item.nativeItemRef?.nativeId === "msg-after-browser" &&
+                item.text === "Comparing the usage total with your budget file.",
+            ),
+          );
+          assert.isTrue(
+            assistantItems.some(
+              (item) =>
+                item.nativeItemRef?.nativeId === "msg-final" &&
+                item.text === '::browser-complete{title="Literal example in final answer"}',
+            ),
+          );
+
+          const browserItems = harness.events.flatMap((event) =>
+            event.type === "turn_item.updated" &&
+            event.turnItem.type === "dynamic_tool" &&
+            event.turnItem.nativeItemRef?.nativeId === "browser-call-1"
+              ? [event.turnItem]
+              : [],
+          );
+          const latestBrowserItem = browserItems.at(-1);
+          assert.equal(latestBrowserItem?.toolSurface, "browser");
+          assert.equal(latestBrowserItem?.toolCompletionTitle, "Verified recent OpenAI usage");
+          assert.deepEqual(latestBrowserItem?.toolIcon, {
+            _tag: "website",
+            pageUrl: "https://platform.openai.com/usage",
+          });
+        }).pipe(
+          Effect.scoped,
+          Effect.provide(
+            Layer.mergeAll(
+              IdAllocator.layer,
+              McpProviderSessions.layer,
+              NodeServices.layer,
+              NodeCrypto.layer,
+            ),
+          ),
+        ),
+    );
+
+    it.effect(
+      "emits a standalone browser activity row when metadata is unavailable and releases diverged commentary prose",
+      () =>
+        Effect.gen(function* () {
+          const scenario = "codex-browser-completion-standalone";
+          const nativeThreadId = `native-${scenario}`;
+          const nativeTurnId = `turn-${scenario}`;
+          const prompt = "Continue sign-in.";
+
+          const transcript = makeCodexReplayTranscript({
+            scenario,
+            entries: [
+              ...codexReplayPreamble({ nativeThreadId, nativeTurnId, prompt }),
+              {
+                type: "emit_inbound",
+                label: "standalone completion started",
+                frame: {
+                  method: "item/started",
+                  params: {
+                    item: {
+                      type: "agentMessage",
+                      id: "msg-pause",
+                      text: "",
+                      phase: "commentary",
+                    },
+                    threadId: nativeThreadId,
+                    turnId: nativeTurnId,
+                    startedAtMs: 1782622440500,
+                  },
+                },
+              },
+              {
+                type: "emit_inbound",
+                label: "standalone completion completed",
+                frame: {
+                  method: "item/completed",
+                  params: {
+                    item: {
+                      type: "agentMessage",
+                      id: "msg-pause",
+                      text: '::browser-complete{title="Paused for a sign-in code"}',
+                      phase: "commentary",
+                    },
+                    threadId: nativeThreadId,
+                    turnId: nativeTurnId,
+                    completedAtMs: 1782622440700,
+                  },
+                },
+              },
+              {
+                type: "emit_inbound",
+                label: "diverged commentary started",
+                frame: {
+                  method: "item/started",
+                  params: {
+                    item: {
+                      type: "agentMessage",
+                      id: "msg-diverged",
+                      text: "",
+                      phase: "commentary",
+                    },
+                    threadId: nativeThreadId,
+                    turnId: nativeTurnId,
+                    startedAtMs: 1782622440800,
+                  },
+                },
+              },
+              {
+                type: "emit_inbound",
+                label: "diverged commentary delta 1",
+                frame: {
+                  method: "item/agentMessage/delta",
+                  params: {
+                    threadId: nativeThreadId,
+                    turnId: nativeTurnId,
+                    itemId: "msg-diverged",
+                    delta: '::browser-complete{title="Example"}',
+                  },
+                },
+              },
+              {
+                type: "emit_inbound",
+                label: "diverged commentary delta 2",
+                frame: {
+                  method: "item/agentMessage/delta",
+                  params: {
+                    threadId: nativeThreadId,
+                    turnId: nativeTurnId,
+                    itemId: "msg-diverged",
+                    delta: " is the marker syntax.",
+                  },
+                },
+              },
+              {
+                type: "emit_inbound",
+                label: "diverged commentary completed",
+                frame: {
+                  method: "item/completed",
+                  params: {
+                    item: {
+                      type: "agentMessage",
+                      id: "msg-diverged",
+                      text: '::browser-complete{title="Example"} is the marker syntax.',
+                      phase: "commentary",
+                    },
+                    threadId: nativeThreadId,
+                    turnId: nativeTurnId,
+                    completedAtMs: 1782622441000,
+                  },
+                },
+              },
+              {
+                type: "emit_inbound",
+                label: "turn/completed",
+                frame: {
+                  method: "turn/completed",
+                  params: {
+                    threadId: nativeThreadId,
+                    turn: makeCodexReplayTurn({ id: nativeTurnId, status: "completed" }),
+                  },
+                },
+              },
+            ],
+          });
+
+          const harness = yield* makeCodexReplayHarness(transcript);
+          const now = yield* DateTime.now;
+          yield* harness.runtime.startTurn(
+            makeCodexTestTurnInput({
+              threadId: harness.threadId,
+              providerThread: harness.providerThread,
+              now,
+              attemptId: RunAttemptId.make("attempt-codex-browser-standalone"),
+              text: prompt,
+            }),
+          );
+          yield* harness.firstTerminal;
+
+          const standaloneItem = harness.events.findLast(
+            (event) =>
+              event.type === "turn_item.updated" &&
+              event.turnItem.type === "dynamic_tool" &&
+              event.turnItem.nativeItemRef?.nativeId === "msg-pause",
+          );
+          assert.isDefined(standaloneItem);
+          if (
+            standaloneItem?.type === "turn_item.updated" &&
+            standaloneItem.turnItem.type === "dynamic_tool"
+          ) {
+            assert.equal(standaloneItem.turnItem.toolName, null);
+            assert.equal(standaloneItem.turnItem.input, null);
+            assert.equal(standaloneItem.turnItem.toolSurface, "browser");
+            assert.equal(standaloneItem.turnItem.toolCompletionTitle, "Paused for a sign-in code");
+            assert.deepEqual(standaloneItem.turnItem.toolSource, {
+              key: "browser-use:browser",
+              name: "Browser",
+              kind: "browser",
+            });
+          }
+
+          const messageEvents = harness.events.flatMap((event) =>
+            event.type === "message.updated" ? [event.message] : [],
+          );
+          assert.deepEqual(
+            messageEvents.map((message) => message.text),
+            ['::browser-complete{title="Example"} is the marker syntax.'],
+          );
+        }).pipe(
+          Effect.scoped,
+          Effect.provide(
+            Layer.mergeAll(
+              IdAllocator.layer,
+              McpProviderSessions.layer,
+              NodeServices.layer,
+              NodeCrypto.layer,
+            ),
+          ),
+        ),
+    );
+  });
 });
 
 describe("codexDynamicToolOutput", () => {
