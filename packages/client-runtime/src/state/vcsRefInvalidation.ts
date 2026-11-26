@@ -86,6 +86,16 @@ export function vcsRefsRepositoryRevision(
   );
 }
 
+export function vcsRefsEnvironmentRevision(
+  registry: AtomRegistry.AtomRegistry,
+  environmentId: EnvironmentId,
+): number {
+  return Math.max(
+    registry.get(stateByEnvironment(environmentId)).revision,
+    registry.get(scopedRevisionsByEnvironment(environmentId)).revision,
+  );
+}
+
 export function trackVcsRefsList(
   registry: AtomRegistry.AtomRegistry,
   target: CachedVcsRefsInvalidationTarget,

@@ -2362,14 +2362,31 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
         ["rev-parse", "--git-common-dir", "--symbolic-full-name", "HEAD"],
         { allowNonZeroExit: true },
       );
-      if (layout.exitCode !== 0 || layout.stdoutTruncated) return null;
       const output = layout.stdout.replace(/\n$/, "");
       // Git paths can contain newlines, while the final line is a ref name or detached HEAD.
       const separator = output.lastIndexOf("\n");
-      if (separator <= 0) return null;
-      const head = output.slice(separator + 1);
-      if (head !== "HEAD" && !head.startsWith("refs/")) return null;
-      const gitCommonDir = yield* resolveGitCommonDirOutput(cwd, output.slice(0, separator));
+      let head = output.slice(separator + 1);
+      let gitCommonDir: string | null;
+      if (
+        layout.exitCode === 0 &&
+        !layout.stdoutTruncated &&
+        separator > 0 &&
+        (head === "HEAD" || head.startsWith("refs/"))
+      ) {
+        gitCommonDir = yield* resolveGitCommonDirOutput(cwd, output.slice(0, separator));
+      } else {
+        // rev-parse needs a commit at HEAD even when show-ref found other branches.
+        const symbolicHead = yield* executeGit(
+          "GitVcsDriver.readBranchPickerRefs",
+          cwd,
+          ["symbolic-ref", "--quiet", "HEAD"],
+          { allowNonZeroExit: true },
+        );
+        if (symbolicHead.exitCode !== 0 || symbolicHead.stdoutTruncated) return null;
+        head = symbolicHead.stdout.replace(/\n$/, "");
+        gitCommonDir = yield* readGitCommonDir(cwd);
+        if (gitCommonDir === null) return null;
+      }
       // Deepening a shallow clone changes ancestry without moving refs.
       const shallowPath = path.join(gitCommonDir, "shallow");
       const shallow = (yield* fileSystem.exists(shallowPath))

@@ -43,13 +43,22 @@ import {
   recordVcsRefsIdentity,
   trackVcsRefsList,
   vcsRefsCacheStateAtom,
+  vcsRefsEnvironmentRevision,
   vcsRefsRepositoryRevision,
   vcsRefsRevisionAtom,
   withVcsRefsPersistenceLock,
 } from "./vcsRefInvalidation.ts";
 
-// Share freshness across search and pagination keys, but keep it local to this registry.
-const serverRefsRevisionAtom = Atom.family((_key: string) => Atom.make(0).pipe(Atom.keepAlive));
+// Share freshness across search and pagination keys for the same cwd.
+const serverRefsRefreshByCwd = Atom.family((_key: string) =>
+  Atom.make<{ readonly revision: number; readonly gitCommonDir: string | undefined } | null>(
+    null,
+  ).pipe(Atom.keepAlive),
+);
+
+function serverRefsRefreshAtom(environmentId: EnvironmentId, cwd: string) {
+  return serverRefsRefreshByCwd(JSON.stringify([environmentId, cwd]));
+}
 
 const OFFLINE_BRANCH_LIST_LIMIT = 100;
 const VCS_REFS_IDLE_TTL_MS = 30_000;
@@ -80,6 +89,8 @@ export const commitVcsRefsRefresh = Effect.fn("CachedVcsRefsState.commitRefresh"
     readonly expectedRevision: number;
     readonly persist: boolean;
     readonly session?: RpcSession;
+    readonly repositoryFreshThrough?: number;
+    readonly forcedAtRevision?: number;
   },
 ) {
   return yield* withVcsRefsPersistenceLock(
@@ -88,7 +99,15 @@ export const commitVcsRefsRefresh = Effect.fn("CachedVcsRefsState.commitRefresh"
       const stateAtom = vcsRefsCacheStateAtom({ environmentId: input.environmentId });
       const state = registry.get(stateAtom);
       if (registry.get(vcsRefsRevisionAtom(input)) !== input.expectedRevision) {
-        return false;
+        return "superseded" as const;
+      }
+      const gitCommonDir = input.refs.gitCommonDir;
+      if (
+        gitCommonDir !== undefined &&
+        vcsRefsRepositoryRevision(registry, input.environmentId, gitCommonDir) >
+          (input.repositoryFreshThrough ?? 0)
+      ) {
+        return "retry" as const;
       }
       let persistedCacheReadable = state.persistedCacheReadable;
       if (input.persist) {
@@ -123,9 +142,17 @@ export const commitVcsRefsRefresh = Effect.fn("CachedVcsRefsState.commitRefresh"
         }
       }
       if (input.session !== undefined) {
-        recordVcsRefsIdentity(registry, input, input.refs.gitCommonDir, input.session);
+        recordVcsRefsIdentity(registry, input, gitCommonDir, input.session);
       }
-      return true;
+      const { forcedAtRevision } = input;
+      if (forcedAtRevision !== undefined) {
+        registry.update(serverRefsRefreshAtom(input.environmentId, input.cwd), (current) =>
+          current !== null && current.revision > forcedAtRevision
+            ? current
+            : { revision: forcedAtRevision, gitCommonDir },
+        );
+      }
+      return "committed" as const;
     }),
   );
 });
@@ -174,20 +201,14 @@ export const makeCachedVcsRefsChanges = Effect.fn("CachedVcsRefsState.makeChange
           Effect.sync(() => trackVcsRefsList(registry, target)).pipe(Effect.andThen(loadCached)),
         );
   const refresh = Effect.fn("CachedVcsRefsState.refresh")(function* (session: RpcSession) {
-    const revisionAtom = serverRefsRevisionAtom(
-      `${environmentId.length}:${environmentId}${input.cwd}`,
-    );
     const read = (force: boolean) =>
       requestInSession(
         session,
         WS_METHODS.vcsListRefs,
         force ? { ...input, refresh: true } : input,
       ).pipe(Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor));
-    const lastRefresh = registry?.get(revisionAtom) ?? 0;
-    const force = input.refresh === true || (expectedRevision ?? 0) > lastRefresh;
-    let refreshedThrough = force ? (expectedRevision ?? 0) : 0;
-    let refs = yield* read(force);
     if (expectedRevision === undefined || registry === undefined) {
+      const refs = yield* read(input.refresh === true);
       if (useCache) {
         yield* cache.saveVcsRefs(environmentId, input.cwd, refs).pipe(
           Effect.catch((error) =>
@@ -203,26 +224,31 @@ export const makeCachedVcsRefsChanges = Effect.fn("CachedVcsRefsState.makeChange
       }
       return Option.some(refs);
     }
-    // A newly visited alias can discover its family only once the server answers.
-    if (refs.gitCommonDir !== undefined) {
-      const familyRevision = vcsRefsRepositoryRevision(registry, environmentId, refs.gitCommonDir);
-      if (familyRevision > Math.max(lastRefresh, refreshedThrough)) {
-        if (!force) refs = yield* read(true);
-        refreshedThrough = familyRevision;
-      }
+    const lastRefresh = registry.get(serverRefsRefreshAtom(environmentId, input.cwd));
+    let force = input.refresh === true || expectedRevision > (lastRefresh?.revision ?? 0);
+    while (true) {
+      const forcedAtRevision = force
+        ? vcsRefsEnvironmentRevision(registry, environmentId)
+        : undefined;
+      const refs = yield* read(force);
+      // An alias can discover its repository only in the response. Compare that repository's
+      // current revision against the freshness already established when this read started.
+      const repositoryFreshThrough =
+        forcedAtRevision ??
+        (lastRefresh?.gitCommonDir === refs.gitCommonDir ? (lastRefresh?.revision ?? 0) : 0);
+      const outcome = yield* commitVcsRefsRefresh(registry, cache, {
+        ...target,
+        refs,
+        expectedRevision,
+        persist: useCache,
+        session,
+        repositoryFreshThrough,
+        ...(forcedAtRevision === undefined ? {} : { forcedAtRevision }),
+      });
+      if (outcome === "committed") return Option.some(refs);
+      if (outcome === "superseded") return Option.none<VcsListRefsResult>();
+      force = true;
     }
-    const committed = yield* commitVcsRefsRefresh(registry, cache, {
-      environmentId,
-      cwd: input.cwd,
-      refs,
-      expectedRevision,
-      persist: useCache,
-      session,
-    });
-    if (committed && refreshedThrough > lastRefresh) {
-      registry.update(revisionAtom, (current) => Math.max(current, refreshedThrough));
-    }
-    return committed ? Option.some(refs) : Option.none<VcsListRefsResult>();
   });
 
   const cachedRefs = Stream.fromEffect(Effect.succeed(cached)).pipe(

@@ -360,7 +360,7 @@ describe("cached VCS refs", () => {
           expectedRevision: 0,
           persist: true,
         }),
-      ).toBe(false);
+      ).toBe("superseded");
 
       expect(yield* Ref.get(saved)).toEqual([]);
       expect(yield* Ref.get(clears)).toBe(1);
@@ -378,7 +378,7 @@ describe("cached VCS refs", () => {
           expectedRevision: 1,
           persist: true,
         }),
-      ).toBe(true);
+      ).toBe("committed");
       expect(yield* Ref.get(saved)).toEqual([LIVE_REFS]);
     }),
   );
@@ -618,7 +618,7 @@ describe("cached VCS refs", () => {
           expectedRevision: state.revision,
           persist: true,
         }),
-      ).toBe(true);
+      ).toBe("committed");
       const recoveredState = registry.get(vcsRefsCacheStateAtom(TARGET));
       expect(recoveredState).toEqual({
         revision: 1,
@@ -919,6 +919,7 @@ const OTHER_ENVIRONMENT = EnvironmentId.make("environment-2");
 
 const setupRefLists = Effect.fnUntraced(function* (
   gitCommonDir: (cwd: string) => string | undefined,
+  beforeListReply?: (input: VcsListRefsInput) => Effect.Effect<void>,
 ) {
   const requests = yield* Queue.unbounded<VcsListRefsInput>();
   const saved = yield* Queue.unbounded<{ cwd: string; refs: VcsListRefsResult }>();
@@ -936,7 +937,7 @@ const setupRefLists = Effect.fnUntraced(function* (
           ...(changed && commonDir === "/repo-0/.git" ? LIVE_REFS : CACHED_REFS),
           ...(commonDir === undefined ? {} : { gitCommonDir: commonDir }),
         };
-      }),
+      }).pipe(Effect.tap(() => beforeListReply?.(input) ?? Effect.void)),
     [WS_METHODS.vcsRefreshStatus]: ({ cwd }: { cwd: string }) =>
       Effect.sync(() => ({
         refsDigest: changed && gitCommonDir(cwd) === "/repo-0/.git" ? "changed" : "first",
@@ -1018,6 +1019,7 @@ const setupRefLists = Effect.fnUntraced(function* (
   return {
     open,
     requests,
+    saved,
     readRequests,
     connectAgain: SubscriptionRef.set(activeSession, Option.some(session(client))),
     offline: SubscriptionRef.set(activeSession, Option.none()),
@@ -1056,6 +1058,42 @@ it.effect("reloads only the affected repository for first and changed digests", 
     expect(change.inputs[0]?.refresh).toBe(true);
     expect(change.writes[0]?.refs.refs).toEqual(LIVE_REFS.refs);
     expect(cwds.slice(1).map(fixture.revision)).toEqual(revisions.slice(1));
+  }),
+);
+
+it.effect("retries an alias reply when its newly discovered repository was invalidated", () =>
+  Effect.gen(function* () {
+    const alias = "/alias";
+    const releaseReply = yield* Deferred.make<void>();
+    let aliasCommonDir = "/old/.git";
+    let delayOnce = true;
+    const fixture = yield* setupRefLists(
+      (cwd) => (cwd === alias ? aliasCommonDir : `${cwd}/.git`),
+      (input) => {
+        if (input.cwd !== alias || input.refresh !== true || !delayOnce) return Effect.void;
+        delayOnce = false;
+        return Deferred.await(releaseReply);
+      },
+    );
+    yield* fixture.open(alias);
+    yield* fixture.readRequests([alias]);
+
+    aliasCommonDir = "/repo-0/.git";
+    yield* fixture.refresh("/old");
+    const forcedRequest = { cwd: alias, limit: 100, refresh: true };
+    expect(yield* Queue.take(fixture.requests)).toEqual(forcedRequest);
+    const aliasRevision = fixture.revision(alias);
+
+    yield* fixture.changeRefs;
+    yield* fixture.refresh("/repo-0");
+    expect(fixture.revision(alias)).toBe(aliasRevision);
+    yield* Deferred.succeed(releaseReply, undefined);
+
+    expect(yield* Queue.take(fixture.saved)).toEqual({
+      cwd: alias,
+      refs: { ...LIVE_REFS, gitCommonDir: aliasCommonDir },
+    });
+    expect(yield* Queue.take(fixture.requests)).toEqual(forcedRequest);
   }),
 );
 
