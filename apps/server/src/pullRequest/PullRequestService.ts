@@ -11,6 +11,7 @@ import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as PubSub from "effect/PubSub";
 import * as Option from "effect/Option";
+import * as Predicate from "effect/Predicate";
 import * as Schema from "effect/Schema";
 import type * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
@@ -528,7 +529,13 @@ function withRateLimitBackoff(
               Effect.provideService(SourceControlRateLimit.Interactive, allowPaused),
               Effect.tap(() => limits.recordSuccess({ ...key, lease })),
               Effect.tapError((error) =>
-                error.reason === "rate-limited"
+                // GitHub's HTTP policy owns cooldowns under the credential that made the request.
+                error.reason === "rate-limited" &&
+                !(
+                  api.kind === "github" &&
+                  (Predicate.isTagged(error.cause, "GitHubApiRateLimitError") ||
+                    Predicate.isTagged(error.cause, "SourceControlRateLimitPausedError"))
+                )
                   ? limits.recordRateLimit({
                       ...key,
                       lease,

@@ -77,7 +77,8 @@ function harness(respond: (request: HttpClientRequest.HttpClientRequest) => Resp
     }),
   );
   const layer = GitHubRest.layer.pipe(
-    Layer.provide(Layer.mergeAll(credentials, http, appSignedOut)),
+    Layer.provide(Layer.merge(credentials, appSignedOut)),
+    Layer.provideMerge(http),
     Layer.provideMerge(GitHubQuota.layer),
     Layer.provideMerge(SourceControlRateLimit.layer),
   );
@@ -475,66 +476,168 @@ describe("GitHubRest", () => {
     }).pipe(Effect.provide(layer), Effect.withTracer(tracer));
   });
 
-  it.effect("lets an interactive request through a pause a background read recorded", () => {
-    const reset = Math.floor(NOW / 1000) + 600;
+  it.effect.each([
+    { remaining: "100", quota: "reserved" },
+    { remaining: "0", quota: "exhausted" },
+  ])("honors a 429 Retry-After with $quota REST quota", ({ remaining }) => {
+    const host = "github.com";
+    const retryAt = NOW + 60_000;
+    const resetAt = NOW + 600_000;
+    const statsData = { repository: { pullRequest: { additions: 3, deletions: 1 } } };
     let call = 0;
-    const { layer, requests } = harness(() =>
+    const { layer, requests } = harness((request) =>
       ++call === 1
         ? json(
-            { message: "API rate limit exceeded" },
+            { message: "You have exceeded a secondary rate limit." },
             {
-              status: 403,
-              headers: { "x-ratelimit-remaining": "0", "x-ratelimit-reset": String(reset) },
+              status: 429,
+              headers: {
+                "x-ratelimit-resource": "core",
+                "x-ratelimit-limit": "5000",
+                "x-ratelimit-remaining": remaining,
+                "x-ratelimit-reset": String(resetAt / 1_000),
+                "retry-after": "60",
+              },
             },
           )
-        : json({ ok: true }),
+        : request.url.endsWith("/graphql")
+          ? json({ data: statsData })
+          : json({ ok: true }),
     );
+
     return Effect.gen(function* () {
       yield* TestClock.setTime(NOW);
       const api = yield* GitHubRest.GitHubRest;
-      const read = { host: "github.com", operation: "sweep", path: "repos/acme/web/pulls" };
-      yield* Effect.flip(api.rest(read));
-      expect((yield* Effect.flip(api.rest(read)))._tag).toBe("SourceControlRateLimitPausedError");
-      const merged = yield* api
-        .rest({
-          host: "github.com",
-          operation: "merge",
-          method: "PUT",
-          path: "repos/acme/web/pulls/7/merge",
-        })
-        .pipe(Effect.provideService(SourceControlRateLimit.Interactive, true));
-      expect(merged.status).toBe(200);
+      const client = yield* GraphQLClient.make(
+        PullRequestBatchesGraphQLGroup.middleware(GitHubGraphQlClient.GitHubGraphQlAuth),
+      ).pipe(Effect.provide(GitHubGraphQlClient.layer));
+      const read = api.rest({ host, operation: "sweep", path: "repos/acme/web/pulls" });
+      const merge = api.rest({
+        host,
+        operation: "merge",
+        method: "PUT",
+        path: "repos/acme/web/pulls/7/merge",
+        allowReserve: true,
+      });
+      const stats = client
+        .PullRequestStats({ owner: "acme", name: "web", number: 7 })
+        .pipe(
+          GitHubGraphQlClient.call({ host, operation: "stats" }),
+          Effect.provideService(SourceControlRateLimit.Interactive, true),
+        );
+
+      expect(yield* Effect.flip(read)).toMatchObject({
+        _tag: "GitHubApiRateLimitError",
+        retryAt,
+      });
+      yield* TestClock.setTime(retryAt - 1);
+      const background = yield* Effect.result(read);
+      const interactiveRest = yield* Effect.result(merge);
+      const interactiveGraphql = yield* Effect.result(stats);
+      expect(requests).toHaveLength(1);
+      for (const result of [background, interactiveRest, interactiveGraphql]) {
+        expect(result).toMatchObject({
+          _tag: "Failure",
+          failure: { _tag: "SourceControlRateLimitPausedError", retryAt },
+        });
+      }
+
+      const otherAccount = yield* read.pipe(
+        Effect.provideService(GitHubRequestPolicy.PinnedGitHubCredential, {
+          host,
+          token: Redacted.make("other-account"),
+          credentialFingerprint: `${host}:other-account`,
+        }),
+      );
+      expect(otherAccount.status).toBe(200);
       expect(requests).toHaveLength(2);
+
+      yield* TestClock.setTime(retryAt + 1);
+      expect(yield* Effect.flip(read)).toMatchObject({
+        _tag: "SourceControlRateLimitPausedError",
+        retryAt: resetAt,
+      });
+      expect(yield* stats).toEqual(statsData);
+      if (remaining === "0") {
+        expect(yield* Effect.flip(merge)).toMatchObject({
+          _tag: "SourceControlRateLimitPausedError",
+          retryAt: resetAt,
+        });
+        expect(requests).toHaveLength(3);
+        yield* TestClock.setTime(resetAt + 1);
+      }
+      expect((yield* merge).status).toBe(200);
+      expect(requests.map((request) => request.headers.authorization)).toEqual([
+        "Bearer first",
+        "Bearer other-account",
+        "Bearer first",
+        "Bearer first",
+      ]);
     }).pipe(Effect.provide(layer));
   });
 
-  it.effect("maps REST 403 with an exhausted quota to a rate limit, and 304 to an answer", () => {
+  it.effect("honors an exhausted REST quota while interactive GraphQL remains available", () => {
+    const host = "github.com";
+    const resetAt = NOW + 600_000;
+    const statsData = { repository: { pullRequest: { additions: 3, deletions: 1 } } };
     let call = 0;
-    const { layer } = harness(() =>
-      ++call === 1
-        ? new Response(null, { status: 304 })
-        : json(
+    const { layer, requests } = harness((request) => {
+      switch (++call) {
+        case 1:
+          return new Response(null, { status: 304 });
+        case 2:
+          return json(
             { message: "API rate limit exceeded" },
             {
               status: 403,
-              headers: { "retry-after": "60" },
+              headers: {
+                "x-ratelimit-remaining": "0",
+                "x-ratelimit-reset": String(resetAt / 1_000),
+              },
             },
-          ),
-    );
+          );
+        default:
+          return request.url.endsWith("/graphql") ? json({ data: statsData }) : json({ ok: true });
+      }
+    });
     return Effect.gen(function* () {
       yield* TestClock.setTime(NOW);
       const api = yield* GitHubRest.GitHubRest;
+      const client = yield* GraphQLClient.make(
+        PullRequestBatchesGraphQLGroup.middleware(GitHubGraphQlClient.GitHubGraphQlAuth),
+      ).pipe(Effect.provide(GitHubGraphQlClient.layer));
       const notModified = yield* api.rest({
-        host: "github.com",
+        host,
         operation: "checks",
         path: "repos/acme/web/pulls/7",
         ifNoneMatch: '"abc"',
       });
       expect(notModified.status).toBe(304);
-      const error = yield* Effect.flip(
-        api.rest({ host: "github.com", operation: "checks", path: "repos/acme/web/pulls/7" }),
-      );
-      expect(error).toMatchObject({ _tag: "GitHubApiRateLimitError", retryAt: NOW + 60_000 });
+      const read = api.rest({
+        host,
+        operation: "checks",
+        path: "repos/acme/web/pulls/7",
+      });
+      expect(yield* Effect.flip(read)).toMatchObject({
+        _tag: "GitHubApiRateLimitError",
+        retryAt: resetAt,
+      });
+      const opened = read.pipe(Effect.provideService(SourceControlRateLimit.Interactive, true));
+      yield* TestClock.setTime(resetAt - 1);
+      const beforeReset = yield* Effect.result(opened);
+      expect(requests).toHaveLength(2);
+      expect(beforeReset).toMatchObject({
+        _tag: "Failure",
+        failure: { _tag: "SourceControlRateLimitPausedError", retryAt: resetAt },
+      });
+      const stats = yield* client
+        .PullRequestStats({ owner: "acme", name: "web", number: 7 })
+        .pipe(GitHubGraphQlClient.call({ host, operation: "stats", allowReserve: true }));
+      expect(stats).toEqual(statsData);
+      expect(requests).toHaveLength(3);
+      yield* TestClock.setTime(resetAt + 1);
+      expect((yield* opened).status).toBe(200);
+      expect(requests).toHaveLength(4);
     }).pipe(Effect.provide(layer));
   });
 

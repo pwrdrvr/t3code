@@ -102,8 +102,9 @@ function classify(input: {
 }): GitHubRequestPolicy.GitHubAnswer<GitHubRestResponse> {
   const { status, headers, body } = input.answer;
   const meta = { status, headers };
-  if (GitHubRequestPolicy.isRateLimited({ status, headers, body })) {
-    return { _tag: "RateLimited", ...meta };
+  const limit = GitHubRequestPolicy.rateLimitKind({ status, headers, body });
+  if (limit !== undefined) {
+    return { _tag: "RateLimited", kind: limit, ...meta };
   }
   if (status === 401) return { _tag: "Unauthorized", ...meta };
   if (status === 404) return { _tag: "NotFound", ...meta };

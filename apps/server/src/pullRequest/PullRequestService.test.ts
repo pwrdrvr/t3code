@@ -5271,6 +5271,60 @@ it.effect("pauses uncached activity on a host after one activity read is rate li
   }),
 );
 
+it.effect("leaves GitHub credential cooldowns to the transport", () =>
+  Effect.gen(function* () {
+    const provider = SourceControlProviderKind.make("github");
+    const host = "github.com";
+    const retryAt = 60_000;
+    const service = yield* makeService({
+      projects: [
+        project({ id: "p1", title: "web", workspaceRoot: "/web", repository: "acme/web" }),
+        project({ id: "p2", title: "api", workspaceRoot: "/api", repository: "acme/api" }),
+      ],
+      providers: [
+        fakePullRequestProvider(provider, {
+          getChangeRequestActivity: ({ repository, number }) =>
+            repository === "acme/web" && number < 3
+              ? Effect.fail(
+                  new PullRequestProviderError({
+                    provider,
+                    operation: "getChangeRequestActivity",
+                    reason: "rate-limited",
+                    detail: "GitHub requests are paused.",
+                    retryAt,
+                    cause: new SourceControlRateLimit.SourceControlRateLimitPausedError({
+                      provider,
+                      host,
+                      retryAt,
+                    }),
+                  }),
+                )
+              : Effect.succeed({
+                  comments: [],
+                  commentCount: 0,
+                  commentsTruncated: false,
+                  reviewThreads: [],
+                  commits: [],
+                }),
+        }),
+      ],
+    });
+    const localDenial = (number: number) =>
+      service
+        .activity({ projectId: "p1" as ProjectId, repository: "acme/web", number })
+        .pipe(Effect.provideService(SourceControlRateLimit.Interactive, true), Effect.flip);
+    yield* TestClock.setTime(retryAt - 2);
+    expect(yield* localDenial(1)).toMatchObject({ cause: { retryAt } });
+    yield* TestClock.setTime(retryAt - 1);
+    expect(yield* localDenial(2)).toMatchObject({ cause: { retryAt } });
+    expect(
+      yield* Effect.result(
+        service.activity({ projectId: "p2" as ProjectId, repository: "acme/api", number: 1 }),
+      ),
+    ).toMatchObject({ _tag: "Success", success: { commentCount: 0 } });
+  }),
+);
+
 it.effect("authorizes cold source reads with paginated paths without fetching patch hunks", () =>
   Effect.gen(function* () {
     const pages: Array<string | undefined> = [];
