@@ -69,6 +69,9 @@ const remoteStatusWithPr: VcsStatusRemoteResult = {
   },
 };
 
+const snapshotWithStamp = (stamp: string | null) =>
+  stamp === null ? null : { gitCommonDir: "/repo/.git", stamp };
+
 function layerTestFor(state: {
   currentLocalStatus: VcsStatusLocalResult;
   currentRemoteStatus: VcsStatusRemoteResult | null;
@@ -146,7 +149,9 @@ function layerTestFor(state: {
                 Effect.andThen(Effect.sync(() => state.currentLocalStatus.refName)),
               ),
         readStatusRefreshRefs: () =>
-          Effect.sync(() => (state.refSnapshot === undefined ? "refs" : state.refSnapshot)),
+          Effect.sync(() =>
+            snapshotWithStamp(state.refSnapshot === undefined ? "refs" : state.refSnapshot),
+          ),
         readStatusPoll: (_cwd, branch) =>
           Effect.sync(() =>
             state.refSnapshot === null
@@ -171,12 +176,12 @@ function layerTestFor(state: {
           ),
         readRefSnapshot: (_cwd, refs) =>
           Effect.sync(() => {
-            state.digestReads?.push(refs);
+            state.digestReads?.push(refs?.stamp);
             const localRefs =
-              refs ?? (state.refSnapshot === undefined ? "refs" : state.refSnapshot);
+              refs?.stamp ?? (state.refSnapshot === undefined ? "refs" : state.refSnapshot);
             return localRefs === null || state.worktreeStamp === null
               ? null
-              : `${localRefs}\0${state.worktreeStamp ?? ""}`;
+              : snapshotWithStamp(`${localRefs}\0${state.worktreeStamp ?? ""}`);
           }),
         upstreamDivergence: () =>
           Effect.sync(() => {
@@ -400,7 +405,11 @@ describe("VcsStatusBroadcaster", () => {
         yield* broadcaster.refreshLocalStatus(`/other-repo-${index}`);
       }
       yield* Deferred.succeed(releasePolicy, undefined);
-      const { refsDigest: _refsDigest, ...result } = yield* Fiber.join(refresh);
+      const {
+        refsDigest: _refsDigest,
+        gitCommonDir: _gitCommonDir,
+        ...result
+      } = yield* Fiber.join(refresh);
       assert.deepStrictEqual(result, { ...baseLocalStatus, ...state.currentRemoteStatus });
     }).pipe(Effect.provide(layer), Effect.scoped);
   });
@@ -767,10 +776,14 @@ describe("VcsStatusBroadcaster", () => {
       return Effect.gen(function* () {
         const broadcaster = yield* VcsStatusBroadcaster.VcsStatusBroadcaster;
         const initial = yield* broadcaster.getStatus({ cwd: "/repo" });
-        const { refsDigest, ...refreshed } = yield* broadcaster.refreshStatus("/repo", {
-          localOnly: true,
-        });
+        const { refsDigest, gitCommonDir, ...refreshed } = yield* broadcaster.refreshStatus(
+          "/repo",
+          {
+            localOnly: true,
+          },
+        );
         assert.isString(refsDigest);
+        assert.equal(gitCommonDir, "/repo/.git");
         assert.deepStrictEqual(refreshed, initial);
         assert.deepStrictEqual(yield* broadcaster.getStatus({ cwd: "/repo" }), refreshed);
         assert.equal(state.localInvalidationCalls, 1);
@@ -999,9 +1012,9 @@ describe("VcsStatusBroadcaster", () => {
           Layer.mock(GitWorkflowService.GitWorkflowService)({
             localStatus: () => Effect.succeed(localStatus),
             currentBranch: () => Effect.succeed(localStatus.refName),
-            readStatusRefreshRefs: () => Effect.succeed("refs"),
+            readStatusRefreshRefs: () => Effect.succeed(snapshotWithStamp("refs")),
             readStatusPoll: () => Effect.succeed(null),
-            readRefSnapshot: () => Effect.succeed("refs"),
+            readRefSnapshot: () => Effect.succeed(snapshotWithStamp("refs")),
             remoteStatus: () => Effect.succeed(remoteStatus),
             invalidateLocalStatus: () => Effect.void,
             invalidateRemoteStatus: () => Effect.void,
@@ -1098,9 +1111,9 @@ describe("VcsStatusBroadcaster", () => {
         Layer.mock(GitWorkflowService.GitWorkflowService)({
           localStatus: () => Effect.succeed(baseLocalStatus),
           currentBranch: () => Effect.succeed(baseLocalStatus.refName),
-          readStatusRefreshRefs: () => Effect.succeed("refs"),
+          readStatusRefreshRefs: () => Effect.succeed(snapshotWithStamp("refs")),
           readStatusPoll: () => Effect.succeed(null),
-          readRefSnapshot: () => Effect.succeed("refs"),
+          readRefSnapshot: () => Effect.succeed(snapshotWithStamp("refs")),
           remoteStatus: () =>
             Effect.gen(function* () {
               remoteReads += 1;
@@ -1147,9 +1160,9 @@ describe("VcsStatusBroadcaster", () => {
         Layer.mock(GitWorkflowService.GitWorkflowService)({
           localStatus: () => Effect.succeed(baseLocalStatus),
           currentBranch: () => Effect.succeed(baseLocalStatus.refName),
-          readStatusRefreshRefs: () => Effect.succeed("refs"),
+          readStatusRefreshRefs: () => Effect.succeed(snapshotWithStamp("refs")),
           readStatusPoll: () => Effect.succeed(null),
-          readRefSnapshot: () => Effect.succeed("refs"),
+          readRefSnapshot: () => Effect.succeed(snapshotWithStamp("refs")),
           remoteStatus: () =>
             Effect.gen(function* () {
               remoteReads += 1;
@@ -1203,9 +1216,9 @@ describe("VcsStatusBroadcaster", () => {
               return state.currentLocalStatus;
             }),
           currentBranch: () => Effect.succeed(state.currentLocalStatus.refName),
-          readStatusRefreshRefs: () => Effect.succeed("refs"),
+          readStatusRefreshRefs: () => Effect.succeed(snapshotWithStamp("refs")),
           readStatusPoll: () => Effect.succeed(null),
-          readRefSnapshot: () => Effect.succeed("refs"),
+          readRefSnapshot: () => Effect.succeed(snapshotWithStamp("refs")),
           remoteStatus: () =>
             Effect.suspend(() => {
               state.remoteStatusCalls += 1;
@@ -1618,8 +1631,8 @@ describe("VcsStatusBroadcaster", () => {
               }),
             currentBranch: () => Effect.succeed(baseLocalStatus.refName),
             invalidateRemoteStatus: () => Effect.void,
-            readStatusRefreshRefs: () => Effect.sync(() => refSnapshot),
-            readRefSnapshot: () => Effect.sync(() => refSnapshot),
+            readStatusRefreshRefs: () => Effect.sync(() => snapshotWithStamp(refSnapshot)),
+            readRefSnapshot: () => Effect.sync(() => snapshotWithStamp(refSnapshot)),
             remoteStatus: () =>
               Deferred.succeed(fetchStarted, undefined).pipe(
                 Effect.andThen(Deferred.await(finishFetch)),

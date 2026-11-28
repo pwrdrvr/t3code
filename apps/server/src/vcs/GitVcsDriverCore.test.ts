@@ -5728,6 +5728,11 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
           const driver = yield* GitVcsDriver.GitVcsDriver;
           const refs = yield* driver.listRefs({ cwd: link });
           assert.isTrue(refs.isRepo);
+          assert.equal(
+            refs.gitCommonDir,
+            yield* fileSystem.realPath(pathService.join(repo, ".git")),
+          );
+          assert.equal((yield* driver.readRefSnapshot(link))?.gitCommonDir, refs.gitCommonDir);
           assert.isFalse(refs.refs.some((ref) => ref.name === "decoy-only"));
           assert.isTrue(refs.refs.some((ref) => ref.name === "real-only"));
 
@@ -6321,7 +6326,9 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
         yield* git(cwd, ["branch", "feature"]);
         yield* git(cwd, ["branch", "same-commit"]);
         const driver = yield* GitVcsDriver.GitVcsDriver;
-        const snapshot = driver.readRefSnapshot(cwd);
+        const snapshot = driver
+          .readRefSnapshot(cwd)
+          .pipe(Effect.map((snapshot) => snapshot?.stamp ?? null));
         const initial = yield* snapshot;
         assert.isNotNull(initial);
 
@@ -6332,6 +6339,15 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
         assert.isNotNull(attached);
         assert.notEqual(attached, initial);
         assert.equal(yield* snapshot, attached);
+        const mainList = yield* driver.listRefs({ cwd, refresh: true });
+        const linkedList = yield* driver.listRefs({ cwd: worktree, refresh: true });
+        assert.isDefined(mainList.gitCommonDir);
+        assert.equal(linkedList.gitCommonDir, mainList.gitCommonDir);
+        assert.equal(
+          (yield* driver.readRefSnapshot(worktree))?.gitCommonDir,
+          mainList.gitCommonDir,
+        );
+        assert.equal(mainList.refs.find((ref) => ref.name === "feature")?.worktreePath, worktree);
         yield* git(worktree, ["checkout", "same-commit"]);
         const switched = yield* snapshot;
         assert.isNotNull(switched);
@@ -6424,9 +6440,9 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
           });
 
           let snapshot = yield* readPoll();
-          const digest = yield* driver.readRefSnapshot(linked);
+          const digest = (yield* driver.readRefSnapshot(linked))?.stamp;
           yield* git(cwd, ["update-ref", "refs/t3/checkpoints/thread/turn", next]);
-          assert.notEqual(yield* driver.readRefSnapshot(linked), digest);
+          assert.notEqual((yield* driver.readRefSnapshot(linked))?.stamp, digest);
           assert.equal(yield* readPoll(), snapshot);
           assert.notEqual(
             (yield* driver.readStatusPoll(sibling, "sibling", false))?.inputStamp,
@@ -6559,7 +6575,9 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
         yield* git(updater, ["config", "user.email", "test@test.com"]);
         yield* git(updater, ["config", "user.name", "Test"]);
         const driver = yield* GitVcsDriver.GitVcsDriver;
-        const snapshot = driver.readRefSnapshot(cwd);
+        const snapshot = driver
+          .readRefSnapshot(cwd)
+          .pipe(Effect.map((snapshot) => snapshot?.stamp ?? null));
 
         // Newer Git can create origin/HEAD on the first fetch.
         yield* git(cwd, ["fetch", "origin"]);
@@ -6585,6 +6603,14 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
         assert.equal(yield* snapshot, detached);
         yield* git(cwd, ["checkout", initialBranch]);
         assert.equal(yield* snapshot, beforeCheckout);
+        const commonDir = (yield* driver.readRefSnapshot(cwd))?.gitCommonDir;
+        assert.isString(commonDir);
+        yield* git(cwd, ["checkout", "--orphan", "orphan"]);
+        const orphan = yield* driver.readRefSnapshot(cwd);
+        assert.equal(orphan?.gitCommonDir, commonDir);
+        assert.include(orphan?.stamp ?? "", "\0refs/heads/orphan\0");
+        yield* git(cwd, ["checkout", initialBranch]);
+        assert.equal(yield* snapshot, beforeCheckout);
         yield* git(cwd, ["branch", "-d", "same-commit"]);
 
         yield* writeTextFile(updater, "remote.txt", "remote\n");
@@ -6599,23 +6625,23 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
         const shallow = yield* makeTmpDir("git-vcs-driver-shallow-");
         yield* git(shallow, ["clone", "--depth=1", NodeURL.pathToFileURL(remote).href, "."]);
         const shallowRefs = yield* git(shallow, ["show-ref", "--head"]);
-        const shallowSnapshot = yield* driver.readRefSnapshot(shallow);
-        assert.isNotNull(shallowSnapshot);
+        const shallowSnapshot = (yield* driver.readRefSnapshot(shallow))?.stamp;
+        assert.isString(shallowSnapshot);
         const shallowBranch = yield* git(shallow, ["symbolic-ref", "--short", "HEAD"]);
         const shallowInputs = yield* driver.readStatusPoll(shallow, shallowBranch, false);
         assert.isNotNull(shallowInputs);
         const shallowWorktree = yield* makeTmpDir("git-vcs-driver-shallow-worktree-");
         yield* git(shallow, ["worktree", "add", "--detach", shallowWorktree]);
-        const worktreeSnapshot = yield* driver.readRefSnapshot(shallowWorktree);
-        assert.isNotNull(worktreeSnapshot);
+        const worktreeSnapshot = (yield* driver.readRefSnapshot(shallowWorktree))?.stamp;
+        assert.isString(worktreeSnapshot);
         const worktreeInputs = yield* driver.readStatusPoll(shallowWorktree, null, false);
         assert.isNotNull(worktreeInputs);
         yield* git(shallow, ["fetch", "--unshallow", "origin"]);
         assert.equal(yield* git(shallow, ["show-ref", "--head"]), shallowRefs);
-        const unshallowSnapshot = yield* driver.readRefSnapshot(shallow);
-        const unshallowWorktreeSnapshot = yield* driver.readRefSnapshot(shallowWorktree);
-        assert.isNotNull(unshallowSnapshot);
-        assert.isNotNull(unshallowWorktreeSnapshot);
+        const unshallowSnapshot = (yield* driver.readRefSnapshot(shallow))?.stamp;
+        const unshallowWorktreeSnapshot = (yield* driver.readRefSnapshot(shallowWorktree))?.stamp;
+        assert.isString(unshallowSnapshot);
+        assert.isString(unshallowWorktreeSnapshot);
         assert.notEqual(unshallowSnapshot, shallowSnapshot);
         assert.notEqual(unshallowWorktreeSnapshot, worktreeSnapshot);
         const deepened = yield* driver.readStatusPoll(shallow, shallowBranch, false);

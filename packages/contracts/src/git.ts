@@ -275,6 +275,7 @@ export const VcsRefreshStatusResult = Schema.Struct({
   ...VcsStatusResult.fields,
   // Digest of the repository's refs after the refresh; absent when they could not be read.
   refsDigest: Schema.optional(TrimmedNonEmptyString),
+  gitCommonDir: Schema.optional(GitFilePath),
 });
 export type VcsRefreshStatusResult = typeof VcsRefreshStatusResult.Type;
 
@@ -294,6 +295,7 @@ export type VcsStatusStreamEvent = typeof VcsStatusStreamEvent.Type;
 
 export const VcsListRefsResult = Schema.Struct({
   isAtRepositoryRoot: Schema.optional(Schema.Boolean),
+  gitCommonDir: Schema.optional(GitFilePath),
   refs: Schema.Array(VcsRef),
   isRepo: Schema.Boolean,
   hasPrimaryRemote: Schema.Boolean,

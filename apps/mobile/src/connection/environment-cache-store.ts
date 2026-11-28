@@ -247,9 +247,13 @@ export const make = Effect.fn("MobileEnvironmentCacheStore.make")(function* () {
         .removeCache(environmentId, "vcs-refs", cwd)
         .pipe(Effect.mapError(mapDatabaseError("remove-vcs-refs"))),
     ),
-    clearVcsRefs: Effect.fn("MobileEnvironmentCache.clearVcsRefs")((environmentId) =>
+    clearVcsRefs: Effect.fn("MobileEnvironmentCache.clearVcsRefs")((environmentId, scope) =>
       database
-        .clearCacheKind(environmentId, "vcs-refs")
+        .clearCacheKind(
+          environmentId,
+          "vcs-refs",
+          scope && ((cwd, payload) => Persistence.shouldClearVcsRefsEntry(scope, cwd, payload)),
+        )
         .pipe(Effect.mapError(mapDatabaseError("clear-vcs-refs"))),
     ),
     clear: Effect.fn("MobileEnvironmentCache.clear")((environmentId) => {

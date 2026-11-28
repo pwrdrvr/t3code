@@ -765,7 +765,11 @@ export const make = Effect.gen(function* () {
   });
 
   const refreshRemoteAndLocalTotals = Effect.fn("VcsStatusBroadcaster.refreshRemoteAndLocalTotals")(
-    function* (cwd: string, policyCwd: string, refsBeforeLocalRead: string | null) {
+    function* (
+      cwd: string,
+      policyCwd: string,
+      refsBeforeLocalRead: GitVcsDriver.GitRefSnapshot | null,
+    ) {
       return yield* withRemoteWriteLock(
         cwd,
         Effect.gen(function* () {
@@ -784,7 +788,11 @@ export const make = Effect.gen(function* () {
           // A fetch, ours or not, can move the base used for local Changes totals.
           const refs =
             refsBeforeLocalRead === null ? null : yield* workflow.readStatusRefreshRefs(cwd);
-          if (refs === null || refs !== refsBeforeLocalRead) {
+          if (
+            refs === null ||
+            refs.stamp !== refsBeforeLocalRead?.stamp ||
+            refs.gitCommonDir !== refsBeforeLocalRead.gitCommonDir
+          ) {
             yield* refreshLocalStatusCore(cwd);
           }
           const parts = yield* getStatusParts(cwd);
@@ -800,12 +808,16 @@ export const make = Effect.gen(function* () {
     const cwd = yield* withFileSystem(normalizeCwd(rawCwd));
     yield* acquireBranchChangesDemand(cwd);
     // Lets the client keep its cached branch list when refs and worktree paths match its last refresh.
-    const withRefsDigest = (status: VcsStatusResult, refs: string | null) =>
+    const withRefsDigest = (status: VcsStatusResult, refs: GitVcsDriver.GitRefSnapshot | null) =>
       refs === null
         ? status
         : {
             ...status,
-            refsDigest: NodeCrypto.createHash("sha256").update(refs).digest("hex").slice(0, 32),
+            refsDigest: NodeCrypto.createHash("sha256")
+              .update(refs.stamp)
+              .digest("hex")
+              .slice(0, 32),
+            gitCommonDir: refs.gitCommonDir,
           };
     if (options?.localOnly) {
       const [refs] = yield* Effect.all(

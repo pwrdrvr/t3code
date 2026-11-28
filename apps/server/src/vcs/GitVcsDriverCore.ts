@@ -2355,21 +2355,43 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
         },
       );
       if (result.exitCode !== 0 || result.stdoutTruncated) return null;
-      const symbolicHead = yield* executeGit(
+      const layout = yield* executeGit(
         "GitVcsDriver.readBranchPickerRefs",
         cwd,
-        ["symbolic-ref", "--quiet", "HEAD"],
+        ["rev-parse", "--git-common-dir", "--symbolic-full-name", "HEAD"],
         { allowNonZeroExit: true },
       );
-      // Exit 1 means detached HEAD; other failures require a full status read.
-      if (symbolicHead.exitCode !== 0 && symbolicHead.exitCode !== 1) return null;
+      const output = layout.stdout.replace(/\n$/, "");
+      // Git paths can contain newlines, while the final line is a ref name or detached HEAD.
+      const separator = output.lastIndexOf("\n");
+      let head = output.slice(separator + 1);
+      let gitCommonDir: string | null;
+      if (
+        layout.exitCode === 0 &&
+        !layout.stdoutTruncated &&
+        separator > 0 &&
+        (head === "HEAD" || head.startsWith("refs/"))
+      ) {
+        gitCommonDir = yield* resolveGitCommonDirOutput(cwd, output.slice(0, separator));
+      } else {
+        // rev-parse needs a commit at HEAD even when show-ref found other branches.
+        const symbolicHead = yield* executeGit(
+          "GitVcsDriver.readBranchPickerRefs",
+          cwd,
+          ["symbolic-ref", "--quiet", "HEAD"],
+          { allowNonZeroExit: true },
+        );
+        if (symbolicHead.exitCode !== 0 || symbolicHead.stdoutTruncated) return null;
+        head = symbolicHead.stdout.replace(/\n$/, "");
+        gitCommonDir = yield* readGitCommonDir(cwd);
+        if (gitCommonDir === null) return null;
+      }
       // Deepening a shallow clone changes ancestry without moving refs.
-      const gitCommonDir = yield* resolveGitCommonDir(cwd);
       const shallowPath = path.join(gitCommonDir, "shallow");
       const shallow = (yield* fileSystem.exists(shallowPath))
         ? yield* fileSystem.readFileString(shallowPath)
         : "";
-      return `${result.stdout}\0${symbolicHead.stdout}\0${shallow}`;
+      return { gitCommonDir, stamp: `${result.stdout}\0${head}\0${shallow}` };
     },
     Effect.orElseSucceed(() => null),
   );
@@ -2380,12 +2402,12 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
     function* (cwd, refs) {
       const localRefs = refs ?? (yield* readBranchPickerRefs(cwd));
       if (localRefs === null) return null;
-      const gitCommonDir = yield* resolveGitCommonDir(cwd);
+      const { gitCommonDir, stamp } = localRefs;
       const worktrees = yield* Cache.get(worktreeBranchPathsCache, gitCommonDir).pipe(
         Effect.timeoutOption(5_000),
         Effect.map(Option.getOrNull),
       );
-      return worktrees === null ? null : `${localRefs}\0${worktrees.stamp}`;
+      return worktrees === null ? null : { gitCommonDir, stamp: `${stamp}\0${worktrees.stamp}` };
     },
     Effect.orElseSucceed(() => null),
   );
@@ -6429,6 +6451,7 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
         ...(repositoryPaths.isAtRepositoryRoot === undefined
           ? {}
           : { isAtRepositoryRoot: repositoryPaths.isAtRepositoryRoot }),
+        gitCommonDir: repositoryPaths.gitCommonDir,
         refs: [...refs.refs],
         isRepo: true,
         hasPrimaryRemote: snapshot.hasPrimaryRemote,
