@@ -1,4 +1,7 @@
+import { it as effectIt } from "@effect/vitest";
+import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
+import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/http";
 import { describe, expect, it } from "vite-plus/test";
 
 import { loadWarnings } from "../core/report.ts";
@@ -19,6 +22,7 @@ import {
   ServerMetrics,
   slope,
 } from "./report.ts";
+import { measureModelPayload, serveFakeAnthropic } from "./server-metrics.ts";
 
 const decodeMetrics = Schema.decodeSync(ServerMetrics);
 
@@ -59,6 +63,67 @@ const gatedRules = [
   { pattern: /gcPauseMs$/, floor: 10, gate: true },
   { pattern: /./, floor: 300, gate: true },
 ];
+
+it("measures the HTTP body and counts system-role messages as instructions", () => {
+  const system = [{ type: "text", text: "cc_version=2.1.330; cc_entrypoint=sdk-ts;" }];
+  const systemMessage = { role: "system", content: "Deferred tools", output_config: {} };
+  const userMessage = { role: "user", content: "Say héllo" };
+  const tool = {
+    name: "AskUserQuestion",
+    description: "Ask a question",
+    input_schema: { type: "object" },
+  };
+  const body = { model: "fixture", system, messages: [systemMessage, userMessage], tools: [tool] };
+  const raw = JSON.stringify(body, null, 2);
+  const jsonBytes = (value: unknown) => Buffer.byteLength(JSON.stringify(value));
+
+  expect(measureModelPayload(raw, body)).toEqual({
+    model: "fixture",
+    claudeVersion: "2.1.330",
+    bodyBytes: Buffer.byteLength(raw),
+    messageBytes: jsonBytes([userMessage]),
+    instructionBytes: jsonBytes([system, systemMessage]),
+    toolBytes: jsonBytes([tool]),
+    tools: [
+      {
+        name: "AskUserQuestion",
+        bytes: jsonBytes(tool),
+        descriptionBytes: jsonBytes(tool.description),
+        inputSchemaBytes: jsonBytes(tool.input_schema),
+      },
+    ],
+  });
+});
+
+effectIt.live("records the token-count HTTP body as auxiliary traffic only in payload mode", () => {
+  const body = JSON.stringify({
+    model: "fixture",
+    tools: [{ name: "one" }, { name: "two" }],
+    messages: [{ role: "user", content: "Say héllo" }],
+  });
+  return Effect.gen(function* () {
+    for (const capturePayload of [true, false]) {
+      const api = yield* serveFakeAnthropic(capturePayload);
+      const response = yield* HttpClient.execute(
+        HttpClientRequest.post(
+          `http://127.0.0.1:${api.port}/v1/messages/count_tokens?beta=true`,
+        ).pipe(HttpClientRequest.bodyText(body)),
+      );
+      expect(yield* response.json).toEqual({ input_tokens: 100 });
+      if (capturePayload) {
+        expect(api.requests).toMatchObject([
+          {
+            agent: false,
+            stream: false,
+            payload: { route: "/v1/messages/count_tokens", bodyBytes: Buffer.byteLength(body) },
+          },
+        ]);
+      } else {
+        expect(api.requests).toEqual([]);
+      }
+    }
+  }).pipe(Effect.scoped, Effect.provide(FetchHttpClient.layer));
+});
 
 describe("compareMetrics", () => {
   it.each([

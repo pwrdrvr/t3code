@@ -1,6 +1,6 @@
 # Performance regression checks
 
-One benchmark per surface, a CI gate on wire size, and a startup profiler:
+One benchmark per surface, CI gates on thread wire and model request size, and a startup profiler:
 
 | Checks                 | Run                               | Source                                                                       |
 | :--------------------- | :-------------------------------- | :--------------------------------------------------------------------------- |
@@ -8,9 +8,10 @@ One benchmark per surface, a CI gate on wire size, and a startup profiler:
 | Web client             | `vp run report:client`            | [`scripts/metrics/web`](../../scripts/metrics/web)                           |
 | Mobile client          | `vp run mobile:metrics`           | [`scripts/metrics/mobile`](../../scripts/metrics/mobile)                     |
 | Thread payload budgets | CI (`thread-transfer-report.yml`) | [`apps/server/integration`](../../apps/server/integration) `TransferBudget*` |
+| Model request budgets  | `vp run report:model-requests`    | [`model-request-benchmark.ts`](../../scripts/model-request-benchmark.ts)     |
 | Cold start             | `vp run profile:startup`          | [`scripts/profile-startup.mjs`](../../scripts/profile-startup.mjs)           |
 
-Each benchmark takes `run`, `ab <checkoutA> <checkoutB>` and `compare`, and `--help` says what
+Each surface benchmark takes `run`, `ab <checkoutA> <checkoutB>` and `compare`, and `--help` says what
 each case measures. Isolated runs on a loaded machine say nothing: compare refs with `ab` on one
 machine, which alternates them (A B, then B A) so drift lands on both sides.
 
@@ -44,10 +45,42 @@ Core wire invariants:
   rows, idle subagents, and older settled threads), and resumes send deltas rather than full
   snapshots.
 
+## Model request budgets
+
+`vp run report:model-requests` starts the real T3 server with fresh state and drives
+`thread start --wait` followed by `thread send --wait`. The pinned Codex, Claude, and
+Antigravity runtimes send requests to synthetic HTTP endpoints on loopback. The server and
+direct runs use fresh provider profiles, dummy keys, and blocked proxy targets. CI runs with
+only the loopback network interface.
+
+```sh
+vp run report:model-requests --codex /path/to/codex --claude /path/to/claude --antigravity /path/to/agy \
+  --budget .t3/model-request-result.json --comparison .t3/model-request-comparison.json
+```
+
+The required runtimes are Codex 0.169.0, Claude Code 2.1.330 (native binary from
+`@anthropic-ai/claude-agent-sdk@0.3.330`), and agy 1.5.16. Omit `--comparison` in CI.
+The comparison pairs each T3 session with a direct first turn from the same physical project
+directory, binary, model, and prompt. Claude uses default permission mode and medium effort.
+Antigravity uses its default permission mode and Gemini 3.1 Pro at low effort. Both Codex paths
+use workspace-write. T3 uses on-request approval, while `codex exec` uses never. The fixture
+uses a plain session because T3 thread launch has no portable per-agent instruction override.
+
+The total counts the exact HTTP body bytes seen during the turn, including auxiliary model
+requests. The breakdown reserializes JSON fields of the largest request carrying the current
+prompt for the configured model, so its components need not add up to the full size. Use
+`--raw <new-local-file>` for opt-in request bodies. Only the numeric budget JSON is uploaded
+by CI. A separate workflow on the default branch validates the artifact and reports the delta
+from a successful `main` measurement.
+
 ## Server process metrics
 
 `report:server` measures server CPU, wakeups, RSS, heap, and first-request latency against a fake
-Anthropic API and the real `claude` CLI:
+Anthropic API and the real `claude` CLI. Run `vp run report:server payload` to inspect one
+turn's model-facing HTTP body sizes and tool definitions using the same fixture. The command
+uses an isolated profile and reports byte counts and tool names.
+
+For process measurements:
 
 - Use `scaling` to separate per-thread cost from fixed server overhead, and `--soak <minutes>` to
   spot rising heap slopes (leaks). A leak only shows in code the soak drives, so give a new

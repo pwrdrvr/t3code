@@ -159,6 +159,7 @@ const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 const decodeJson = <S extends Schema.Top>(schema: S) =>
   Schema.decodeUnknownEffect(Schema.fromJsonString(schema));
 const encodeMetrics = Schema.encodeEffect(fromJsonStringPretty(ServerMetrics));
+const encodePrettyJson = Schema.encodeEffect(fromJsonStringPretty(Schema.Unknown));
 
 interface ApiRequest {
   readonly at: number;
@@ -167,6 +168,7 @@ interface ApiRequest {
   readonly marker: string | undefined;
   /** The request carries a tool result, so it is a turn's follow-up rather than its start. */
   readonly toolResult: boolean;
+  readonly payload?: ReturnType<typeof measureModelPayload> & { readonly route: string };
   /** When the reply's last event was produced; streamed replies only. */
   endedAt?: number;
 }
@@ -175,10 +177,44 @@ const MessagesRequest = Schema.Struct({
   stream: Schema.optional(Schema.Boolean),
   model: Schema.optional(Schema.String),
   tools: Schema.optional(Schema.Array(Schema.Unknown)),
+  system: Schema.optional(Schema.Unknown),
   messages: Schema.optional(
-    Schema.Array(Schema.Struct({ role: Schema.String, content: Schema.Unknown })),
+    Schema.Array(
+      Schema.StructWithRest(Schema.Struct({ role: Schema.String, content: Schema.Unknown }), [
+        Schema.Record(Schema.String, Schema.Unknown),
+      ]),
+    ),
   ),
 });
+
+export function measureModelPayload(raw: string, body: typeof MessagesRequest.Type) {
+  const bytes = (value: unknown) =>
+    value === undefined ? 0 : Buffer.byteLength(encodeJson(value));
+  const messages = body.messages?.filter((message) => message.role !== "system");
+  const systemMessages = body.messages?.filter((message) => message.role === "system") ?? [];
+  const instructions = [body.system, ...systemMessages].filter((value) => value !== undefined);
+  const runtime = /\bcc_version=([\d.]+[\w.-]*)/.exec(raw)?.[1];
+  return {
+    model: body.model,
+    ...(runtime === undefined ? {} : { claudeVersion: runtime }),
+    bodyBytes: Buffer.byteLength(raw),
+    messageBytes: bytes(messages),
+    instructionBytes: bytes(instructions),
+    toolBytes: bytes(body.tools),
+    tools: (body.tools ?? []).flatMap((tool) =>
+      typeof tool === "object" && tool !== null && "name" in tool && typeof tool.name === "string"
+        ? [
+            {
+              name: tool.name,
+              bytes: bytes(tool),
+              descriptionBytes: "description" in tool ? bytes(tool.description) : 0,
+              inputSchemaBytes: "input_schema" in tool ? bytes(tool.input_schema) : 0,
+            },
+          ]
+        : [],
+    ),
+  };
+}
 
 /** Whether the newest message hands back a tool's result. */
 const endsInToolResult = (messages: typeof MessagesRequest.Type.messages) => {
@@ -196,11 +232,15 @@ const endsInToolResult = (messages: typeof MessagesRequest.Type.messages) => {
 };
 
 /** Streams a canned reply to every Messages request; a prompt holding SLOW_MARKER streams slowly. */
-const serveFakeAnthropic = Effect.fn("serverMetrics.serveFakeAnthropic")(function* () {
+export const serveFakeAnthropic = Effect.fn("serverMetrics.serveFakeAnthropic")(function* (
+  capturePayload = false,
+) {
   const requests: ApiRequest[] = [];
   const app = Effect.gen(function* () {
     const request = yield* HttpServerRequest.HttpServerRequest;
-    if (request.url.includes("count_tokens")) {
+    const route = request.url.split("?")[0] ?? "";
+    const tokenCount = route === "/v1/messages/count_tokens";
+    if (tokenCount && !capturePayload) {
       return HttpServerResponse.jsonUnsafe({ input_tokens: 100 });
     }
     if (!request.url.startsWith("/v1/messages")) {
@@ -213,18 +253,22 @@ const serveFakeAnthropic = Effect.fn("serverMetrics.serveFakeAnthropic")(functio
     const body = yield* decodeJson(MessagesRequest)(raw).pipe(
       Effect.orElseSucceed((): typeof MessagesRequest.Type => ({})),
     );
-    const streamed = body.stream === true;
-    const toolResult = endsInToolResult(body.messages);
+    const streamed = !tokenCount && body.stream === true;
+    const toolResult = !tokenCount && endsInToolResult(body.messages);
     const entry: ApiRequest = {
       toolResult,
       at: yield* nowMs,
       stream: streamed,
+      ...(capturePayload ? { payload: { route, ...measureModelPayload(raw, body) } } : {}),
       // Title and branch-name jobs carry only their structured-output tool; the agent carries many.
       agent: streamed && (body.tools?.length ?? 0) > 1,
       // A follow-up carries the thread's earlier prompts too, so the newest marker is the turn's.
       marker: [...raw.matchAll(/bench-run-\d+/g)].at(-1)?.[0],
     };
     requests.push(entry);
+    if (tokenCount) {
+      return HttpServerResponse.jsonUnsafe({ input_tokens: 100 });
+    }
     const model = body.model ?? MODEL;
     const id = `msg_bench_${requests.length}`;
     if (!streamed) {
@@ -570,6 +614,10 @@ interface ServerOptions {
   readonly seed?: string;
   /** A fake GitHub host the project's origin points at. */
   readonly forge?: FakeGitHub;
+  readonly isolatedCredentials?: boolean;
+  readonly project?: string;
+  readonly settings?: Record<string, unknown>;
+  readonly env?: Record<string, string>;
 }
 
 /** Transcript text: paths there are words in a conversation, which the server never acts on. */
@@ -764,7 +812,7 @@ const prepareSeed = Effect.fn("serverMetrics.prepareSeed")(function* (
 });
 
 /** A fresh server with its own base dir and git project, stopped when the scope closes. */
-const startServer = Effect.fn("serverMetrics.startServer")(function* (
+export const startServer = Effect.fn("serverMetrics.startServer")(function* (
   environment: Environment,
   name: string,
   options: ServerOptions = {},
@@ -780,16 +828,18 @@ const startServer = Effect.fn("serverMetrics.startServer")(function* (
     directory: environment.home,
     prefix: `${name}-`,
   });
-  const project = path.join(directory, "project");
-  yield* fs.makeDirectory(project);
-  yield* fs.writeFileString(path.join(project, "README.md"), "# bench\n");
-  for (const args of [
-    // Loose refs on purpose: the soak writes them as files, which a reftable store would ignore.
-    ["-c", "init.defaultRefFormat=files", "init", "-q", "-b", "main"],
-    ["add", "."],
-    ["-c", "user.email=bench@t3.codes", "-c", "user.name=bench", "commit", "-qm", "init"],
-  ]) {
-    yield* run("git", args, { cwd: project });
+  const project = options.project ?? path.join(directory, "project");
+  if (options.project === undefined) {
+    yield* fs.makeDirectory(project);
+    yield* fs.writeFileString(path.join(project, "README.md"), "# bench\n");
+    for (const args of [
+      // Loose refs on purpose: the soak writes them as files, which a reftable store would ignore.
+      ["-c", "init.defaultRefFormat=files", "init", "-q", "-b", "main"],
+      ["add", "."],
+      ["-c", "user.email=bench@t3.codes", "-c", "user.name=bench", "commit", "-qm", "init"],
+    ]) {
+      yield* run("git", args, { cwd: project });
+    }
   }
   if (options.forge !== undefined) yield* options.forge.setupProject(project);
   const baseDir = path.join(directory, "base");
@@ -803,7 +853,11 @@ const startServer = Effect.fn("serverMetrics.startServer")(function* (
   const largest = seeded?.largest;
   yield* fs.writeFileString(
     path.join(baseDir, "userdata/settings.json"),
-    encodeJson({ textGenerationModelSelection: { instanceId: "claudeAgent", model: MODEL } }),
+    encodeJson(
+      options.settings ?? {
+        textGenerationModelSelection: { instanceId: "claudeAgent", model: MODEL },
+      },
+    ),
   );
   const dropped = new Set([
     "ANTHROPIC_AUTH_TOKEN",
@@ -814,7 +868,11 @@ const startServer = Effect.fn("serverMetrics.startServer")(function* (
   const env: Record<string, string> = {
     ...Object.fromEntries(
       Object.entries(hostEnvironment).filter(
-        (entry): entry is [string, string] => entry[1] !== undefined && !dropped.has(entry[0]),
+        (entry): entry is [string, string] =>
+          entry[1] !== undefined &&
+          !dropped.has(entry[0]) &&
+          (!options.isolatedCredentials ||
+            ["PATH", "Path", "SystemRoot", "TMPDIR", "TEMP", "TMP"].includes(entry[0])),
       ),
     ),
     HOME: environment.home,
@@ -822,9 +880,18 @@ const startServer = Effect.fn("serverMetrics.startServer")(function* (
     ANTHROPIC_BASE_URL: `http://127.0.0.1:${environment.apiPort}`,
     ANTHROPIC_API_KEY: "sk-bench",
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
+    ...(options.isolatedCredentials
+      ? {
+          DISABLE_NONESSENTIAL_MODEL_CALLS: "1",
+          NO_PROXY: "127.0.0.1",
+          HTTP_PROXY: "http://127.0.0.1:1",
+          HTTPS_PROXY: "http://127.0.0.1:1",
+        }
+      : {}),
     OTEL_SDK_DISABLED: "true",
     T3CODE_DEV_SEED: "0",
     ...options.forge?.env,
+    ...options.env,
   };
   const port = yield* freePort;
   const started = yield* nowMs;
@@ -1017,18 +1084,24 @@ const startServer = Effect.fn("serverMetrics.startServer")(function* (
     loopStart: devtools.loopStart,
     loopRead: devtools.loopRead,
     project,
+    cli,
     ballast: devtools.ballast,
     issueToken: cli(["auth", "session", "issue", "--token-only"]).pipe(
       Effect.map(({ stdout }) => stdout.trim()),
     ),
-    threadStart: (message: string, extra: ReadonlyArray<string> = [], root = project) =>
+    threadStart: (
+      message: string,
+      extra: ReadonlyArray<string> = [],
+      root = project,
+      model = MODEL,
+    ) =>
       cli([
         "thread",
         "start",
         "--provider",
         "claudeAgent",
         "--model",
-        MODEL,
+        model,
         ...extra,
         root,
         message,
@@ -2259,6 +2332,65 @@ const withSeed = Effect.fn("serverMetrics.withSeed")(function* (
   return seeded;
 });
 
+const payloadCommand = Command.make(
+  "payload",
+  {
+    model: Flag.String("model").pipe(Flag.withDefault("claude-sonnet-5-5")),
+    prompt: Flag.String("prompt").pipe(
+      Flag.withDefault(
+        "Inspect the sample checkout tests and explain which wait condition is wrong.",
+      ),
+    ),
+  },
+  Effect.fn("serverMetrics.payload")(function* ({ model, prompt }) {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const checkout = path.resolve(import.meta.dirname, "../../..");
+    const home = yield* fs.makeTempDirectoryScoped({ prefix: "t3-model-payload-" });
+    const api = yield* serveFakeAnthropic(true);
+    const server = yield* startServer(
+      {
+        home,
+        apiPort: api.port,
+        requests: api.requests,
+        noAgentScope: true,
+        serverDir: path.join(checkout, "apps/server"),
+        checkout,
+      },
+      "payload",
+      { isolatedCredentials: true },
+    );
+    const start = api.requests.length;
+    const result = yield* server.threadStart(prompt, ["--wait"], server.project, model);
+    if (result.exitCode !== 0) {
+      return yield* new MetricsError({
+        message: `thread start failed: ${result.stderr.trim() || result.stdout.trim()}`,
+      });
+    }
+    const requests = api.requests.slice(start);
+    if (!requests.some((request) => request.agent)) {
+      return yield* new MetricsError({ message: "the fake endpoint saw no Claude agent request" });
+    }
+    yield* Console.log(
+      yield* encodePrettyJson({
+        totalBodyBytes: requests.reduce(
+          (sum, request) => sum + (request.payload?.bodyBytes ?? 0),
+          0,
+        ),
+        requests: requests.flatMap((request) =>
+          request.payload
+            ? [{ agent: request.agent, stream: request.stream, ...request.payload }]
+            : [],
+        ),
+      }),
+    );
+  }, Effect.scoped),
+).pipe(
+  Command.withDescription(
+    "Measure one Claude turn's outbound HTTP request bodies against a local fake Anthropic API.",
+  ),
+);
+
 const runCommand = Command.make(
   "run",
   {
@@ -2444,7 +2576,7 @@ Which scenario answers what:
 
 Trust a change only from \`ab\` on one machine. compare gates on floors measured from A/A runs (\`noise\`), shows metrics too noisy to gate on without counting them, and warns when other processes loaded the machine; rerun then. --quick suits a per-PR or nightly check; decide on full runs.`,
   ),
-  Command.withSubcommands([runCommand, abCommand, compareCommand, noiseCommand]),
+  Command.withSubcommands([runCommand, abCommand, compareCommand, noiseCommand, payloadCommand]),
 );
 
 if (import.meta.main) {
