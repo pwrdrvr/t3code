@@ -12,6 +12,7 @@ export interface ExtractedToolActivityPresentation {
   readonly toolSurface?: ToolActivitySurface;
   readonly toolIcon?: ToolActivityIcon;
   readonly toolSource?: ToolActivitySource;
+  readonly toolCompletionTitle?: string;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -129,11 +130,13 @@ export function extractToolActivityPresentation(
       ? COMPUTER_USE_TOOL_SOURCE
       : retainedSource;
   const toolIcon = activityIcon(payload?.toolIcon);
+  const toolCompletionTitle = trimmedString(payload?.toolCompletionTitle, 512);
   const viewedImagePath = trimmedString(payload?.viewedImagePath, 4096);
   return {
     ...(toolSurface ? { toolSurface } : {}),
     ...(toolIcon ? { toolIcon } : {}),
     ...(toolSource ? { toolSource } : {}),
+    ...(toolCompletionTitle ? { toolCompletionTitle } : {}),
     ...(viewedImagePath &&
     !/[\r\n]/.test(viewedImagePath) &&
     isWorkspaceImagePreviewPath(viewedImagePath)

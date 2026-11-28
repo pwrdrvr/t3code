@@ -2294,3 +2294,87 @@ it("caps live thought previews while preserving reasoning detail", () => {
   expect(JSON.parse(activity.getFullDetail()!).item).toMatchObject({ text });
   expect(activity.getCopyText()).toContain(text);
 });
+
+it("presents correlated and standalone Codex browser completion headlines on mobile", () => {
+  const at = "2026-06-20T00:00:02.000Z";
+  const browserSource = {
+    key: "browser-use:chrome",
+    name: "Chrome",
+    kind: "integration" as const,
+  };
+  const websiteIcon = {
+    _tag: "website" as const,
+    pageUrl: "https://platform.openai.com/usage",
+  };
+  const browserCall1: OrchestrationV2TurnItem = {
+    ...base("browser-1", at, 1),
+    type: "dynamic_tool",
+    toolName: "node_repl.js",
+    title: "Open usage dashboard",
+    toolSurface: "browser",
+    toolIcon: websiteIcon,
+    toolSource: browserSource,
+    input: { title: "Open usage dashboard", code: "await page.goto(url);" },
+  };
+  const browserCall2: OrchestrationV2TurnItem = {
+    ...base("browser-2", at, 2),
+    type: "dynamic_tool",
+    toolName: "node_repl.js",
+    title: "Read current month totals",
+    toolSurface: "browser",
+    toolIcon: websiteIcon,
+    toolSource: browserSource,
+    input: { title: "Read current month totals", code: "await page.textContent('main');" },
+  };
+  const completionCommentary: OrchestrationV2TurnItem = {
+    ...base("browser-complete-1", at, 3),
+    type: "assistant_message",
+    phase: "commentary",
+    messageId: MessageId.make("msg-browser-complete-1"),
+    text: '::browser-complete{title="Verified recent OpenAI usage"}',
+    streaming: false,
+  };
+  const standaloneCompletion: OrchestrationV2TurnItem = {
+    ...base("browser-complete-2", at, 5),
+    type: "assistant_message",
+    phase: "commentary",
+    messageId: MessageId.make("msg-browser-complete-2"),
+    text: '::browser-complete{title="Paused for a sign-in code"}',
+    streaming: false,
+  };
+
+  const feed = buildThreadFeed([
+    projected(userMessage(), 0),
+    projected(browserCall1, 1),
+    projected(browserCall2, 2),
+    projected(completionCommentary, 3),
+    projected(command(), 4),
+    projected(standaloneCompletion, 5),
+  ]);
+  const rows = deriveThreadFeedPresentation(
+    feed,
+    { runId, status: "completed", startedAt: at, completedAt: at },
+    new Set([runId]),
+    new Set(),
+    null,
+  );
+
+  expect(rows.filter((row) => row.type === "message")).toHaveLength(1);
+  const workRows = rows.filter((row) => row.type !== "run-fold" && row.type !== "message");
+  expect(workRows[0]).toMatchObject({
+    type: "work-toggle",
+    summary: "Verified recent OpenAI usage",
+    toolSurface: "browser",
+    toolIcon: websiteIcon,
+  });
+  expect(workRows[2]).toMatchObject({
+    type: "activity-group",
+    activities: [
+      {
+        summary: "Paused for a sign-in code",
+        canExpand: false,
+        icon: "browser",
+      },
+    ],
+  });
+});

@@ -1799,6 +1799,7 @@ const OrchestrationV2TurnItemBaseFields = {
   toolSurface: Schema.optional(ToolActivitySurface),
   toolIcon: Schema.optional(ToolActivityIcon),
   toolSource: Schema.optional(ToolActivitySource),
+  toolCompletionTitle: Schema.optional(TrimmedNonEmptyString),
   id: TurnItemId,
   threadId: ThreadId,
   runId: Schema.NullOr(RunId),

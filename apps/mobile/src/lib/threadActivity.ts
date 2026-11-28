@@ -9,6 +9,10 @@ import {
   isLiveSubagentTurnItem,
   waitingOnSubagentsLabel,
 } from "@t3tools/client-runtime/state/subagentRuntime";
+import {
+  isStandaloneBrowserCompletionItem,
+  normalizeBrowserCompletionTurnItems,
+} from "@t3tools/client-runtime/work-log/browser-completion";
 import { extractToolActivityPresentation } from "@t3tools/client-runtime/work-log/tool-presentation";
 import {
   turnItemDetailRevision,
@@ -658,6 +662,9 @@ function itemSummary(
   if (item.type === "notification") return item.summary;
   if (item.type === "system_notice") return item.message;
   if (item.type === "compaction") return contextCompactionLabel(item, resolve);
+  if (isStandaloneBrowserCompletionItem(item) && item.toolCompletionTitle) {
+    return item.toolCompletionTitle;
+  }
   const title =
     (item.type === "dynamic_tool"
       ? dynamicToolTitle(item.toolName, item.input, item.title, resolve)
@@ -969,6 +976,7 @@ function singleToolCallLabel(
     return expanded
       ? resolve(msg("Thought"))
       : compactWorkEntryText(activity.workEntry.detail ?? "") || resolve(msg("Thought"));
+  if (activity.workEntry.toolCompletionTitle) return activity.workEntry.toolCompletionTitle;
   const presentation = resolveWorkEntryToolPresentation(activity.workEntry, "completed", resolve);
   if (presentation) return presentation.displayName;
   const command = activity.workEntry.command?.trim();
@@ -2250,11 +2258,20 @@ function appendActivityGroupRows(
     }
     groupableRun = [];
   };
-  for (const activity of activities) {
+  for (let index = 0; index < activities.length; index += 1) {
+    const activity = activities[index]!;
     const item = activity.projectedItem.item;
     const severeProviderError = item.type === "error" && item.status === "failed";
-    if (!activity.prominent && !severeProviderError && item.type !== "notification") {
+    if (
+      !activity.prominent &&
+      !severeProviderError &&
+      item.type !== "notification" &&
+      !isStandaloneBrowserCompletionItem(item)
+    ) {
       groupableRun.push(activity);
+      if (activity.workEntry.toolCompletionTitle !== undefined && index < activities.length - 1) {
+        flushGroupableRun(false);
+      }
       continue;
     }
     flushGroupableRun(false);
@@ -2505,7 +2522,7 @@ function firstChangedIndex<T>(previous: ReadonlyArray<T>, next: ReadonlyArray<T>
 }
 
 export function buildThreadFeed(
-  visibleTurnItems: ReadonlyArray<OrchestrationV2ProjectedTurnItem>,
+  rawVisibleTurnItems: ReadonlyArray<OrchestrationV2ProjectedTurnItem>,
   options?: {
     readonly anchoredMessages?: ReadonlyArray<LocalThreadMessage>;
     readonly attempts?: ReadonlyArray<OrchestrationV2RunAttempt>;
@@ -2516,6 +2533,7 @@ export function buildThreadFeed(
     readonly locale?: string;
   },
 ): ReadonlyArray<ThreadFeedEntry> {
+  const visibleTurnItems = normalizeBrowserCompletionTurnItems(rawVisibleTurnItems);
   const anchoredMessages = options?.anchoredMessages ?? [];
   const resolve = options?.resolve ?? m;
   const locale = options?.locale;

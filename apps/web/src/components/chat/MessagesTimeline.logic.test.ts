@@ -322,6 +322,145 @@ describe("deriveMessagesTimelineRows", () => {
     });
   });
 
+  it("presents correlated and standalone Codex browser completion headlines in browser activity rows", () => {
+    const fixture = makeStreamingTimelineFixture();
+    const source = fixture.visibleTurnItems.find((row) => row.item.type === "dynamic_tool")!;
+    if (source.item.type !== "dynamic_tool") throw new Error("Expected tool fixture");
+    const browserSource = {
+      key: "browser-use:chrome",
+      name: "Chrome",
+      kind: "integration" as const,
+    };
+    const websiteIcon = {
+      _tag: "website" as const,
+      pageUrl: "https://platform.openai.com/usage",
+    };
+    const common = {
+      ...source.item,
+      threadId: fixture.threadId,
+      runId: fixture.runId,
+      status: "completed" as const,
+    };
+    const firstBrowser = {
+      ...source,
+      sourceItemId: TurnItemId.make("browser-1"),
+      item: {
+        ...common,
+        id: TurnItemId.make("browser-1"),
+        ordinal: 1,
+        type: "dynamic_tool" as const,
+        toolName: "node_repl.js",
+        title: "Open usage dashboard",
+        toolSurface: "browser" as const,
+        toolIcon: websiteIcon,
+        toolSource: browserSource,
+        input: { title: "Open usage dashboard", code: "await page.goto(url);" },
+      },
+    };
+    const secondBrowser = {
+      ...source,
+      sourceItemId: TurnItemId.make("browser-2"),
+      item: {
+        ...common,
+        id: TurnItemId.make("browser-2"),
+        ordinal: 2,
+        type: "dynamic_tool" as const,
+        toolName: "node_repl.js",
+        title: "Read current month totals",
+        toolSurface: "browser" as const,
+        toolIcon: websiteIcon,
+        toolSource: browserSource,
+        input: { title: "Read current month totals", code: "await page.textContent('main');" },
+      },
+    };
+    const completionCommentary = {
+      ...source,
+      sourceItemId: TurnItemId.make("browser-complete-1"),
+      item: {
+        ...common,
+        id: TurnItemId.make("browser-complete-1"),
+        ordinal: 3,
+        type: "assistant_message" as const,
+        phase: "commentary" as const,
+        messageId: MessageId.make("msg-browser-complete-1"),
+        text: '::browser-complete{title="Verified recent OpenAI usage"}',
+        streaming: false,
+      },
+    };
+    const followUpCommand = {
+      ...source,
+      sourceItemId: TurnItemId.make("cmd-after"),
+      item: {
+        ...common,
+        id: TurnItemId.make("cmd-after"),
+        ordinal: 4,
+        type: "command_execution" as const,
+        input: "cat usage.csv",
+        output: "ok",
+      },
+    };
+    const standaloneCompletion = {
+      ...source,
+      sourceItemId: TurnItemId.make("browser-complete-2"),
+      item: {
+        ...common,
+        id: TurnItemId.make("browser-complete-2"),
+        ordinal: 5,
+        type: "assistant_message" as const,
+        phase: "commentary" as const,
+        messageId: MessageId.make("msg-browser-complete-2"),
+        text: '::browser-complete{title="Paused for a sign-in code"}',
+        streaming: false,
+      },
+    };
+
+    const entries = deriveTimelineEntriesFromVisibleTurnItems({
+      visibleTurnItems: [
+        firstBrowser,
+        secondBrowser,
+        completionCommentary,
+        followUpCommand,
+        standaloneCompletion,
+      ],
+      optimisticMessages: [],
+    });
+    const rows = deriveMessagesTimelineRows({
+      timelineEntries: entries,
+      isWorking: false,
+      activeTurnStartedAt: null,
+      turnDiffSummaries: [],
+      supportsConversationRollback: false,
+      expandedRunIds: new Set([fixture.runId]),
+    });
+
+    expect(rows.filter((row) => row.kind === "message")).toHaveLength(0);
+    const workRows = rows.filter((row) => row.kind !== "turn-fold");
+    expect(workRows[0]).toMatchObject({
+      kind: "work-toggle",
+      summary: "Verified recent OpenAI usage",
+      toolSurface: "browser",
+      toolIcon: websiteIcon,
+    });
+    expect(workRows[1]).toMatchObject({
+      kind: "work",
+      displayLabel: "cat usage.csv",
+    });
+    expect(workRows[2]).toMatchObject({
+      kind: "work",
+      groupedEntries: [
+        {
+          id: TurnItemId.make("browser-complete-2"),
+          toolSurface: "browser",
+          toolCompletionTitle: "Paused for a sign-in code",
+        },
+      ],
+    });
+    expect(
+      workRows[2]?.kind === "work" &&
+        workEntryDisplayLabel(workRows[2].groupedEntries[0]!, undefined),
+    ).toBe("Paused for a sign-in code");
+  });
+
   it.each(["waiting", "completed"] as const)(
     "groups approval and user-input requests with commands without expanding them when %s",
     (status) => {
